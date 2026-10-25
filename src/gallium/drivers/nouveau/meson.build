@@ -168,6 +168,7 @@ files_libnouveau += files('nouveau_nvdec.c', 'nouveau_nvdec.h',
                           'nouveau_nvdec_h264.c', 'nouveau_nvdec_h264.h',
                           'nouveau_nvdec_av1.c', 'nouveau_nvdec_av1.h',
                           'nouveau_nvdec_av1_probs.c',
+                          'nouveau_nvdec_av1_grain.c',
                           'nouveau_nvdec_hevc.c', 'nouveau_nvdec_hevc.h',
                           'nouveau_nvdec_vp9.c', 'nouveau_nvdec_vp9.h',
                           'nouveau_nvdec_vp9_tables.h')
@@ -177,6 +178,7 @@ if get_option('nouveau-nvenc')
     'nouveau_nvenc_config.c',
     'nouveau_nvenc_h264.c', 'nouveau_nvenc_h264.h',
     'nouveau_nvenc_rc.c', 'nouveau_nvenc_rc.h',
+    'nouveau_nvenc_hevc.c', 'nouveau_nvenc_hevc.h',
     'nouveau_nvenc_tables.c', 'nouveau_nvenc_tables.h',
   )
   nouveau_video_args += '-DHAVE_NOUVEAU_NVENC'

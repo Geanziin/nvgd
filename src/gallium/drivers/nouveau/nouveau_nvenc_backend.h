@@ -17,7 +17,15 @@ enum nvenc_profile {
    NVENC_PROFILE_BASELINE,
    NVENC_PROFILE_MAIN,
    NVENC_PROFILE_HIGH,
+   NVENC_PROFILE_HEVC_MAIN,
+   NVENC_PROFILE_HEVC_MAIN10,
 };
+
+static inline bool
+nvenc_profile_is_hevc(enum nvenc_profile profile)
+{
+   return profile == NVENC_PROFILE_HEVC_MAIN || profile == NVENC_PROFILE_HEVC_MAIN10;
+}
 
 static inline unsigned
 nvenc_profile_idc(enum nvenc_profile profile)

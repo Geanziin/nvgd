@@ -26,6 +26,8 @@ struct nouveau_nvdec_av1_frame {
    int primary;
    int projections[3];
    uint8_t reference_map[7];
+   /* Borrowed Gallium display planes; reference planes remain grain-free. */
+   struct pipe_resource *display[2];
 };
 
 void nouveau_nvdec_av1_default_cdf(unsigned qctx, void *table);
@@ -35,5 +37,7 @@ bool nouveau_nvdec_av1_picture(const struct pipe_av1_picture_desc *picture,
                                const struct nouveau_nvdec_av1_ref *const refs[8],
                                struct nouveau_nvdec_av1_frame *out);
 unsigned nouveau_nvdec_av1_filter_size(unsigned width, unsigned height);
+bool nouveau_nvdec_av1_film_grain(const struct pipe_av1_picture_desc *picture,
+                                  av1_fgs_cfg_t *config, AV1FilmGrainMemory *memory);
 
 #endif

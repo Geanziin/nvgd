@@ -30,6 +30,7 @@
 
 #include "nouveau_nvenc_backend.h"
 #include "nouveau_nvenc_h264.h"
+#include "nouveau_nvenc_hevc.h"
 
 #define NVENC_SLOTS 4
 #define NVENC_TIMEOUT_NS 1000000000ull
@@ -52,6 +53,8 @@ enum shared_buffer {
    SHARED_RECON_UV_1,
    SHARED_HISTORY,
    SHARED_COLOC,
+   SHARED_MEPRED_0,
+   SHARED_MEPRED_1,
    SHARED_BUFFERS
 };
 
@@ -81,6 +84,7 @@ struct nvenc_backend {
    enum nvenc_profile profile;
    unsigned sequence, generation, frames;
    unsigned recon_idx;
+   unsigned poc, rate_num, rate_den, sample_bytes;
    bool has_keyframe;
    bool allocated, poisoned;
    pthread_mutex_t mutex;
@@ -185,6 +189,10 @@ gob_offset(unsigned x, unsigned y, unsigned pitch, unsigned height)
 static int
 make_config(struct nvenc_backend *s, struct slot *slot, unsigned qp)
 {
+   if (nvenc_profile_is_hevc(s->profile)) {
+      slot->config_qp = qp;
+      return 0;
+   }
    int ret =
       nvenc_make_config(s->coded_width, s->coded_height, qp, &slot->config);
    if (ret)
@@ -303,8 +311,9 @@ nvenc_backend_create(int fd, unsigned width, unsigned height, unsigned qp,
                      enum nvenc_profile profile,
                      struct nvenc_backend **output)
 {
-   if (fd < 0 || !output || *output || width < 160 || width > 1920 ||
-       height < 96 || height > 1088 || (width & 1) || (height & 1) || qp > 51)
+   bool hevc = nvenc_profile_is_hevc(profile);
+   if (fd < 0 || !output || *output || width < 160 || width > (hevc ? 3840 : 1920) ||
+       height < 96 || height > (hevc ? 2160 : 1088) || (width & 1) || (height & 1) || qp > 51)
       return -EINVAL;
    struct nvenc_backend *s = calloc(1, sizeof(*s));
    if (!s)
@@ -313,9 +322,13 @@ nvenc_backend_create(int fd, unsigned width, unsigned height, unsigned qp,
    pthread_mutex_init(&s->mutex, NULL);
    s->width = width;
    s->height = height;
-   s->coded_width = (width + 15) & ~15u;
-   s->coded_height = (height + 15) & ~15u;
-   s->pitch = (width + 63) & ~63u;
+   unsigned alignment = hevc ? 32 : 16;
+   s->coded_width = (width + alignment - 1) & ~(alignment - 1);
+   s->coded_height = (height + alignment - 1) & ~(alignment - 1);
+   s->sample_bytes = profile == NVENC_PROFILE_HEVC_MAIN10 ? 2 : 1;
+   s->pitch = ((width * s->sample_bytes) + 63) & ~63u;
+   s->rate_num = frame_rate_num;
+   s->rate_den = frame_rate_den;
    s->profile = profile;
    s->level =
       nouveau_nvenc_h264_level(width, height, frame_rate_num, frame_rate_den);
@@ -339,13 +352,31 @@ nvenc_backend_create(int fd, unsigned width, unsigned height, unsigned qp,
    if (ret)
       goto fail;
    for (unsigned i = 0; i < SHARED_BUFFERS; i++) {
-      ret = allocate(s->fd, &s->shared[i], 4 << 20, shared_domain(i));
+      size_t bytes = 4 << 20;
+      if (hevc && i <= SHARED_RECON_UV_1) {
+         unsigned rows = i & 1 ? ((s->coded_height / 2 + 31) & ~31u) : s->coded_height;
+         bytes = (size_t)s->pitch * rows + 65536;
+      } else if (i == SHARED_MEPRED_0 || i == SHARED_MEPRED_1) {
+         bytes = ((size_t)(s->coded_width / 16) * (s->coded_height / 16) * 64 + 0xffff) & ~0xffff;
+         if (bytes < 65536)
+            bytes = 65536;
+      }
+      ret = allocate(s->fd, &s->shared[i], bytes, shared_domain(i));
       if (ret)
          goto fail;
    }
    for (unsigned i = 0; i < NVENC_SLOTS; i++) {
       for (unsigned j = 0; j < SLOT_BUFFERS; j++) {
-         size_t size = j <= SLOT_CONFIG ? 4096 : (4 << 20);
+          size_t size = j <= SLOT_CONFIG ? 4096 : (4 << 20);
+         if (hevc && (j == SLOT_INPUT_Y || j == SLOT_INPUT_UV)) {
+            unsigned rows = j == SLOT_INPUT_Y ? s->coded_height : ((s->coded_height / 2 + 31) & ~31u);
+            size = (size_t)s->pitch * rows + 65536;
+         }
+         if (hevc && j == SLOT_BITSTREAM) {
+            size_t worst = (size_t)s->coded_width * s->coded_height * 2 * s->sample_bytes + 4096;
+            if (size < worst)
+               size = worst;
+         }
          if (j == SLOT_STATUS)
             size = (sizeof(nvenc_stat_data_s) + 4095) & ~(size_t)4095;
          ret = allocate(s->fd, &s->slots[i].buffers[j], size, slot_domain(j));
@@ -482,6 +513,7 @@ upload(const struct nvenc_backend *s, struct slot *slot, const uint8_t *y,
    const uint8_t *planes[] = {y, uv};
    const unsigned pitches[] = {y_pitch, uv_pitch};
    for (unsigned plane = 0; plane < 2; plane++) {
+      unsigned width_bytes = s->width * s->sample_bytes;
       uint8_t *map = slot->buffers[plane ? SLOT_INPUT_UV : SLOT_INPUT_Y].map;
       for (unsigned row = 0; row < (s->coded_height >> plane); row++) {
          unsigned source_y =
@@ -493,12 +525,12 @@ upload(const struct nvenc_backend *s, struct slot *slot, const uint8_t *y,
           * recalculating the tiled address and copying one byte at a time.
           * Keep the scalar tail for partial runs and edge replication.
           */
-         for (; x + 16 <= s->width; x += 16)
+         for (; x + 16 <= width_bytes; x += 16)
             memcpy(map + gob_offset(x, row, s->pitch, 2), source + x, 16);
          for (; x < s->pitch; x++) {
-            unsigned source_x = x < s->width ? x
-                                             : s->width - (plane ? 2 : 1) +
-                                                  (plane ? x % 2 : 0);
+            unsigned pixel_bytes = (plane ? 2 : 1) * s->sample_bytes;
+            unsigned source_x = x < width_bytes ? x :
+                                  width_bytes - pixel_bytes + x % pixel_bytes;
             map[gob_offset(x, row, s->pitch, 2)] =
                source[source_x];
          }
@@ -522,8 +554,9 @@ push_frame(struct nvenc_backend *s, struct slot *slot,
 
    uint32_t *cursor = push->map;
    method(&cursor, 0, NVC7B7_VIDEO_ENCODER);
-   method(&cursor, NVC7B7_SET_APPLICATION_ID, 1);
-   method(&cursor, NVC7B7_SET_CONTROL_PARAMS, 3);
+   bool hevc = nvenc_profile_is_hevc(s->profile);
+   method(&cursor, NVC7B7_SET_APPLICATION_ID, hevc ? 3 : 1);
+   method(&cursor, NVC7B7_SET_CONTROL_PARAMS, (hevc ? 4 : 3) | 0x100);
    method(&cursor, NVC7B7_SET_PICTURE_INDEX, slot->seq);
    method(&cursor, NVC7B7_SET_IN_DRV_PIC_SETUP, slot->buffers[SLOT_CONFIG].info.offset >> 8);
    method(&cursor, NVC7B7_SET_IN_CUR_PIC, luma >> 8);
@@ -540,9 +573,17 @@ push_frame(struct nvenc_backend *s, struct slot *slot,
    method(&cursor, NVC7B7_SET_IOHISTORY, s->shared[SHARED_HISTORY].info.offset >> 8);
    method(&cursor, NVC7B7_SET_OUT_ENC_STATUS, slot->buffers[SLOT_STATUS].info.offset >> 8);
    method(&cursor, NVC7B7_SET_OUT_BITSTREAM, slot->buffers[SLOT_BITSTREAM].info.offset >> 8);
-   method(&cursor, NVC7B7_SET_IN_COLOC_DATA, s->shared[SHARED_COLOC].info.offset >> 8);
-   method(&cursor, NVC7B7_SET_IN_PARTITION_BUF, slot->buffers[SLOT_BITSTREAM].info.offset >> 8);
-   method(&cursor, NVC7B7_SET_OUT_COLOC_DATA, s->shared[SHARED_COLOC].info.offset >> 8);
+   if (!hevc) {
+      method(&cursor, NVC7B7_SET_IN_COLOC_DATA, s->shared[SHARED_COLOC].info.offset >> 8);
+      method(&cursor, NVC7B7_SET_IN_PARTITION_BUF, slot->buffers[SLOT_BITSTREAM].info.offset >> 8);
+      method(&cursor, NVC7B7_SET_OUT_COLOC_DATA, s->shared[SHARED_COLOC].info.offset >> 8);
+   }
+   if (slot->is_p_frame) {
+      const unsigned me_in = ref_recon == 0 ? SHARED_MEPRED_0 : SHARED_MEPRED_1;
+      const unsigned me_out = out_recon == 0 ? SHARED_MEPRED_0 : SHARED_MEPRED_1;
+      method(&cursor, NVC7B7_SET_IN_MEPRED_DATA, s->shared[me_in].info.offset >> 8);
+      method(&cursor, NVC7B7_SET_OUT_MEPRED_DATA, s->shared[me_out].info.offset >> 8);
+   }
    method(&cursor, NVC7B7_EXECUTE, 0);
    method(&cursor, NVC7B7_SEMAPHORE_A, fence->info.offset >> 32);
    method(&cursor, NVC7B7_SEMAPHORE_B, fence->info.offset);
@@ -554,7 +595,7 @@ push_frame(struct nvenc_backend *s, struct slot *slot,
       uint64_t offset;
       uint32_t domain;
       bool read_only;
-   } list[16];
+   } list[24];
    unsigned count = 0;
 #define ADD_BO(buf, dom, ro)                                                 \
    (list[count++] =                                                          \
@@ -584,6 +625,12 @@ push_frame(struct nvenc_backend *s, struct slot *slot,
    }
    ADD_BO(&s->shared[SHARED_HISTORY], NOUVEAU_GEM_DOMAIN_GART, false);
    ADD_BO(&s->shared[SHARED_COLOC], NOUVEAU_GEM_DOMAIN_GART, false);
+   if (slot->is_p_frame) {
+      const unsigned me_in = ref_recon == 0 ? SHARED_MEPRED_0 : SHARED_MEPRED_1;
+      const unsigned me_out = out_recon == 0 ? SHARED_MEPRED_0 : SHARED_MEPRED_1;
+      ADD_BO(&s->shared[me_in], NOUVEAU_GEM_DOMAIN_GART, true);
+      ADD_BO(&s->shared[me_out], NOUVEAU_GEM_DOMAIN_GART, false);
+   }
 #undef ADD_BO
    struct drm_nouveau_gem_pushbuf_bo bos[ARRAY_SIZE(list)] = {0};
    for (unsigned i = 0; i < count; i++) {
@@ -726,7 +773,23 @@ submit(struct nvenc_backend *s, const uint8_t *y, unsigned y_pitch,
       s->frames++;
    }
 
-   memcpy(slot->buffers[SLOT_CONFIG].map, &config, sizeof(config));
+   if (nvenc_profile_is_hevc(s->profile)) {
+      s->poc = is_p_frame ? s->poc + 1 : 0;
+      struct nvenc_hevc_params params = {
+         .width = s->width, .height = s->height,
+         .bit_depth = s->sample_bytes == 2 ? 10 : 8, .qp = qp,
+         .pitch_bytes = s->pitch, .history_bytes = s->shared[SHARED_HISTORY].info.size,
+         .bitstream_bytes = slot->buffers[SLOT_BITSTREAM].info.size,
+         .rate_num = s->rate_num, .rate_den = s->rate_den,
+         .poc = s->poc, .ref_slot = ref_recon >= 0 ? ref_recon : 0, .idr = !is_p_frame,
+      };
+      if (!nouveau_nvenc_hevc_config(slot->buffers[SLOT_CONFIG].map, &params)) {
+         ret = -EINVAL;
+         goto done;
+      }
+   } else {
+      memcpy(slot->buffers[SLOT_CONFIG].map, &config, sizeof(config));
+   }
    memset(slot->buffers[SLOT_STATUS].map, 0xcd, 128);
    __atomic_store_n((uint32_t *)slot->buffers[SLOT_FENCE].map, 0,
                     __ATOMIC_RELEASE);
@@ -754,8 +817,8 @@ nvenc_backend_submit(struct nvenc_backend *s, const uint8_t *y,
                      unsigned qp, bool is_p_frame,
                      struct nvenc_ticket *ticket)
 {
-   if (!s || !y || !uv || !ticket || qp > 51 || y_pitch < s->width ||
-       uv_pitch < s->width)
+   if (!s || !y || !uv || !ticket || qp > 51 || y_pitch < s->width * s->sample_bytes ||
+       uv_pitch < s->width * s->sample_bytes)
       return -EINVAL;
    return submit(s, y, y_pitch, uv, uv_pitch, NULL, qp, is_p_frame, ticket);
 }
@@ -841,20 +904,43 @@ nvenc_backend_collect(struct nvenc_backend *s,
    if (stat.picture_index != ticket->seq || stat.error_status != 2 ||
        stat.ucode_error_status || (stat.pic_type != 3 && stat.pic_type != 0) ||
        stat.num_slices != 1 || !stat.total_bit_count ||
-       stat.total_bit_count > (4u << 20) * 8) {
+       stat.total_bit_count > slot->buffers[SLOT_BITSTREAM].info.size * 8) {
       ret = -EIO;
       channel_reset(s);
       goto done;
    }
    uint8_t parameter_sets[256];
-   const size_t prefix = headers(s, slot->qp, parameter_sets);
+   size_t prefix = 0;
+   if (nvenc_profile_is_hevc(s->profile)) {
+      if (!slot->is_p_frame) {
+         const struct nvenc_hevc_params params = {
+            .width = s->width, .height = s->height,
+            .bit_depth = s->sample_bytes == 2 ? 10 : 8,
+            .rate_num = s->rate_num, .rate_den = s->rate_den,
+         };
+         prefix = nouveau_nvenc_hevc_headers(&params, parameter_sets, sizeof(parameter_sets));
+         if (!prefix) {
+            ret = -EINVAL;
+            slot->busy = false;
+            goto done;
+         }
+      }
+   } else {
+      prefix = headers(s, slot->qp, parameter_sets);
+      if (!prefix) {
+         ret = -EINVAL;
+         slot->busy = false;
+         goto done;
+      }
+   }
    const size_t coded = (stat.total_bit_count + 7) / 8;
    if (prefix + coded > capacity) {
       ret = -ENOSPC;
       slot->busy = false;
       goto done;
    }
-   memcpy(output, parameter_sets, prefix);
+   if (prefix)
+      memcpy(output, parameter_sets, prefix);
    memcpy((uint8_t *)output + prefix, slot->buffers[SLOT_BITSTREAM].map,
           coded);
    *bytes = prefix + coded;

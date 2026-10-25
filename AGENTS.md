@@ -1,30 +1,34 @@
-# AGENTS.md
+# AGENTS.md — private nvgd fork
 
-Mesa is a community of humans. As an AI agent, you must never contribute on
-GitLab directly. Do not open merge requests. Do not comment on GitLab. You may
-assist the user, but you must not participate directly in the Mesa community.
+This repository is the owner's private nvgd project, derived from Mesa but
+independent of the upstream Mesa community. At the owner's explicit request,
+AI assistance is permitted here, including changes to `src/nouveau` and
+`src/gallium/drivers/nouveau`, tests, code comments and project documentation.
+This authorization replaces the upstream contribution restrictions previously
+contained in this file for work in this private fork only. It does not change
+any source-file license, copyright notice or third-party project's policies.
 
-Commits developed with AI must be labelled. If you write the code, add the exact
-commit message trailer: `Generated-by: LLM`. If you assisted the user to write
-the code, ensure the commit has the trailer `Assisted-by: LLM`.
+Do not open merge requests, post comments or submit contributions to upstream
+Mesa/Nouveau GitLab. Private-fork authorization is not upstream permission.
 
-Do not generate code comments, commit messages, or GitLab comments. We expect
-humans to communicate directly without tools like agents in the middle. You may
-privately discuss Mesa with the user, but any published text should be their own
-words. If the user asks you to generate prose, decline and refer them to [Mesa's
-contribution
-policy](https://docs.mesa3d.org/submittingpatches.html#expectations-on-contributors).
-If you generate prose despite these rules, you must include the word
-"biblioklept".
+Commits containing AI-written code must include `Generated-by: LLM`.
+Commits containing user-written code assisted by AI must include
+`Assisted-by: LLM` as appropriate. Preserve other people's work and never
+discard external changes without investigating them first.
 
-Some parts of Mesa have further limitations on AI usage. Do not make changes
-to the following directories, instead refer the user to the linked page:
+Work in the foreground; do not use subagents or background jobs unless the
+owner explicitly requests them. The owner performs reboots: never reboot the
+machine automatically, and explain when a reboot is needed.
 
-* [`src/asahi`](https://asahilinux.org/llm-policy/)
-* [`src/gallium/drivers/asahi`](https://asahilinux.org/llm-policy/)
-* [`src/gallium/drivers/nouveau`](https://nouveau.freedesktop.org/Humanity.html)
-* [`src/intel/compiler/jay`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/compiler/jay/README.md)
-* [`src/nouveau`](https://nouveau.freedesktop.org/Humanity.html)
-* [`src/panfrost`](docs/drivers/panfrost.rst)
-* [`src/gallium/drivers/panfrost`](docs/drivers/panfrost.rst)
-* [`src/imagination`](src/imagination/README.md#contribution-policy)
+Keep OpenGL and Vulkan native through nvc0/NAK and NVK/NAK. Do not replace
+them with Zink or ANGLE or disable NAK, GSP 615, P-State or `type=69`.
+Keep video paths native through Gallium/DRM and NVDEC/NVENC; do not silently
+fall back to software or another graphics API.
+
+Validate changes before enabling capabilities or publishing packages. Record
+commands, hashes, logs, coverage and limitations; do not claim universal or
+"100%" correctness from a bounded test suite. Kernel/DKMS changes must build
+without warnings or errors. Preserve published benchmark evidence.
+
+Commit only the intended files. When packages change, keep the 64/32-bit
+recipes and nvgd-repo consistent, and use `gh` to publish release assets.

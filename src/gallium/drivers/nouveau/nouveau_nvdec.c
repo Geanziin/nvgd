@@ -339,7 +339,7 @@ submit_frame(struct nouveau_nvdec *dec, unsigned current, enum nvdec_kind kind,
              const struct nvdec_vp9_submit *vp9,
              const uint8_t references[16])
 {
-   struct nouveau_pushbuf_refn refs[NVDEC_BUFFERS + NVDEC_PICTURES * 5];
+   struct nouveau_pushbuf_refn refs[NVDEC_BUFFERS + NVDEC_PICTURES * 5 + 2];
    unsigned count = 0;
    for (unsigned i = 0; i < NVDEC_BUFFERS; i++) {
       if (dec->buffers[i])
@@ -363,6 +363,12 @@ submit_frame(struct nouveau_nvdec *dec, unsigned current, enum nvdec_kind kind,
          for (unsigned b = 0; b < ARRAY_SIZE(bos); b++)
             refs[count++] = (struct nouveau_pushbuf_refn) {bos[b],
                                                            NOUVEAU_BO_GART | NOUVEAU_BO_RDWR};
+      }
+   }
+   if (av1 && av1->pic.enable_fgs) {
+      for (unsigned i = 0; i < 2; i++) {
+         struct nv04_resource *plane = nv04_resource(av1->display[i]);
+         refs[count++] = (struct nouveau_pushbuf_refn) {plane->bo, plane->domain | NOUVEAU_BO_WR};
       }
    }
    int ret = nouveau_pushbuf_space(dec->push, 256, 0, 0);
@@ -468,6 +474,16 @@ submit_frame(struct nouveau_nvdec *dec, unsigned current, enum nvdec_kind kind,
       method(push, NVC7B0_AV1_SET_FILM_GRAIN_BUF_OFFSET, buffer_address(dec, NVDEC_AV1_GRAIN));
       method(push, NVC7B0_AV1_SET_TILE_STREAM_INFO_BUF_OFFSET,
              buffer_address(dec, NVDEC_AV1_TILE_STREAM));
+      if (av1->pic.enable_fgs) {
+         struct nv50_miptree *disp_y = nv50_miptree(av1->display[0]);
+         method(push, NVC7B0_SET_DISPLAY_BUF_SIZE, (uint32_t)disp_y->base.bo->size);
+         for (unsigned i = 0; i < 2; i++) {
+            struct nv50_miptree *mt = nv50_miptree(av1->display[i]);
+            uint64_t address = mt->base.address + mt->level[0].offset;
+            method(push, i ? NVC7B0_SET_DISPLAY_BUF_CHROMA_OFFSET :
+                             NVC7B0_SET_DISPLAY_BUF_LUMA_OFFSET, address >> 8);
+         }
+      }
    } else if (kind == NVDEC_KIND_H264) {
       method(push, NVC5B0_H264_SET_MBHIST_BUF_OFFSET, buffer_address(dec, NVDEC_MBHIST));
    }
@@ -561,6 +577,40 @@ end_frame_av1(struct nouveau_nvdec *dec, struct pipe_video_buffer *target,
                                   y->level[0].pitch, uv->level[0].pitch,
                                   dec->width, dec->height, refmeta, &frame))
       return dec->error = -EINVAL;
+   if (frame.pic.enable_fgs) {
+      struct pipe_resource *planes[3] = {NULL};
+      if (!picture->film_grain_target || !get_surface(dec, picture->film_grain_target, planes)) {
+         frame.pic.enable_fgs = 0;
+      } else {
+         bool conflict = false;
+         for (unsigned i = 0; i < 2; i++) {
+            struct nv50_miptree *mt = nv50_miptree(planes[i]);
+            if (mt->level[0].pitch != (i ? uv : y)->level[0].pitch) {
+               conflict = true;
+               break;
+            }
+            /* Applying grain must never modify a live reference (including
+             * the current reconstructed picture). Reject aliasing imports.
+             */
+            for (unsigned slot = 0; slot < NVDEC_PICTURES; slot++) {
+               for (unsigned p = 0; p < 2; p++) {
+                  struct pipe_resource *ref = dec->surfaces[slot].planes[p];
+                  if (ref && nv04_resource(ref)->bo->handle == mt->base.bo->handle) {
+                     conflict = true;
+                     break;
+                  }
+               }
+               if (conflict)
+                  break;
+            }
+            if (conflict)
+               break;
+            frame.display[i] = planes[i];
+         }
+         if (conflict)
+            frame.pic.enable_fgs = 0;
+      }
+   }
    int ret = finish_pipe(&dec->base);
    if (!ret && !surface->cdf)
       ret = allocate_bo(dec, &surface->cdf, NVDEC_AV1_CDF_SIZE);
@@ -584,6 +634,8 @@ end_frame_av1(struct nouveau_nvdec *dec, struct pipe_video_buffer *target,
    memcpy(dec->buffers[NVDEC_PICTURE]->map, &frame.pic, sizeof(frame.pic));
    memcpy(dec->buffers[NVDEC_AV1_TILES]->map, frame.tiles, sizeof(frame.tiles));
    memcpy(dec->buffers[NVDEC_AV1_GM]->map, frame.global_motion, sizeof(frame.global_motion));
+   if (frame.pic.enable_fgs)
+      memcpy(dec->buffers[NVDEC_AV1_GRAIN]->map, &frame.grain, sizeof(frame.grain));
    memcpy(dec->buffers[NVDEC_BITSTREAM]->map, dec->stream.data, dec->stream.size);
    memset((uint8_t *)dec->buffers[NVDEC_BITSTREAM]->map + dec->stream.size, 0, 64);
    memset(dec->buffers[NVDEC_STATUS]->map, 0, dec->buffers[NVDEC_STATUS]->size);

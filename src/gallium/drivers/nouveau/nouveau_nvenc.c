@@ -57,6 +57,9 @@ struct nvenc_feedback {
 static bool
 profile_supported(enum pipe_video_profile profile)
 {
+   if ((profile == PIPE_VIDEO_PROFILE_HEVC_MAIN || profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) &&
+       debug_get_bool_option("NOUVEAU_NVENC_HEVC", true))
+      return true;
    return profile == PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE ||
           profile == PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE ||
           profile == PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN ||
@@ -67,6 +70,10 @@ static enum nvenc_profile
 backend_profile(enum pipe_video_profile profile)
 {
    switch (profile) {
+   case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+      return NVENC_PROFILE_HEVC_MAIN;
+   case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+      return NVENC_PROFILE_HEVC_MAIN10;
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
       return NVENC_PROFILE_HIGH;
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
@@ -101,28 +108,57 @@ nouveau_nvenc_param(struct nouveau_screen *screen,
        !profile_supported(profile) || !kernel_supported(screen))
       return 0;
 
+   bool hevc = nvenc_profile_is_hevc(backend_profile(profile));
+
    switch (param) {
    case PIPE_VIDEO_CAP_SUPPORTED:
    case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
    case PIPE_VIDEO_CAP_ENC_MAX_SLICES_PER_FRAME:
    case PIPE_VIDEO_CAP_MAX_TEMPORAL_LAYERS:
    case PIPE_VIDEO_CAP_ENC_QUALITY_LEVEL:
-   case PIPE_VIDEO_CAP_ENC_DRIVER_GENERATED_HEADERS:
       return 1;
+   case PIPE_VIDEO_CAP_ENC_DRIVER_GENERATED_HEADERS:
+      return hevc ? 0 : 1;
    case PIPE_VIDEO_CAP_ENC_RATE_CONTROL_MODES:
       return (1 << PIPE_H2645_ENC_RATE_CONTROL_METHOD_DISABLE) |
              (1 << PIPE_H2645_ENC_RATE_CONTROL_METHOD_CONSTANT) |
-             (1 << PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE);
+              (1 << PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE);
+   case PIPE_VIDEO_CAP_ENC_MAX_REFERENCES_PER_FRAME:
+      return hevc ? 1 : 0; /* one L0 reference, no L1/B frames */
+   case PIPE_VIDEO_CAP_ENC_HEVC_PREDICTION_DIRECTION:
+      return hevc ? PIPE_H265_PRED_DIRECTION_PREVIOUS : 0;
+   case PIPE_VIDEO_CAP_ENC_HEVC_FEATURE_FLAGS: {
+      if (!hevc)
+         return 0;
+      union pipe_h265_enc_cap_features f = { .value = 0 };
+      f.bits.config_supported = 1;
+      f.bits.amp = f.bits.sao = f.bits.cu_qp_delta = 2; /* required by the emitted SPS/PPS */
+      f.bits.transform_skip = profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ? 2 : 0;
+      return f.value;
+   }
+   case PIPE_VIDEO_CAP_ENC_HEVC_BLOCK_SIZES: {
+      if (!hevc)
+         return 0;
+      union pipe_h265_enc_cap_block_sizes b = { .value = 0 };
+      b.bits.config_supported = 1;
+      b.bits.log2_max_coding_tree_block_size_minus3 = 2;
+      b.bits.log2_min_coding_tree_block_size_minus3 = 2;
+      b.bits.log2_min_luma_coding_block_size_minus3 = 1;
+      b.bits.log2_max_luma_transform_block_size_minus2 = 3;
+      b.bits.max_max_transform_hierarchy_depth_inter = b.bits.min_max_transform_hierarchy_depth_inter = 3;
+      b.bits.max_max_transform_hierarchy_depth_intra = b.bits.min_max_transform_hierarchy_depth_intra = 3;
+      return b.value;
+   }
    case PIPE_VIDEO_CAP_MAX_WIDTH:
-      return 1920;
+      return hevc ? 3840 : 1920;
    case PIPE_VIDEO_CAP_MAX_HEIGHT:
-      return 1088;
+      return hevc ? 2160 : 1088;
    case PIPE_VIDEO_CAP_MIN_WIDTH:
       return 160;
    case PIPE_VIDEO_CAP_MIN_HEIGHT:
       return 96;
    case PIPE_VIDEO_CAP_MAX_MACROBLOCKS:
-      return 8160;
+      return hevc ? (3840 / 16) * (2160 / 16) : 8160;
    case PIPE_VIDEO_CAP_ENC_SUPPORTS_FEEDBACK_METADATA:
       return PIPE_VIDEO_FEEDBACK_METADATA_TYPE_ENCODE_RESULT |
              PIPE_VIDEO_FEEDBACK_METADATA_TYPE_AVERAGE_FRAME_QP;
@@ -151,9 +187,94 @@ destroy_codec(struct pipe_video_codec *base)
 }
 
 static void
+begin_hevc_frame(struct pipe_video_codec *base, struct pipe_video_buffer *target,
+                  struct pipe_picture_desc *picture)
+{
+   struct nvenc_codec *codec = (struct nvenc_codec *)base;
+   struct pipe_h265_enc_picture_desc *desc = (struct pipe_h265_enc_picture_desc *)picture;
+   const struct pipe_h265_enc_rate_control *rate = &desc->rc[0];
+   bool inter = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_P;
+   bool intra = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_I ||
+                 desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR;
+   bool ten = base->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10;
+   codec->error = 0;
+   codec->is_p_frame = inter;
+   codec->qp = inter ? rate->quant_p_frames : rate->quant_i_frames;
+   if (!target || target->buffer_format != (ten ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12) ||
+       target->interlaced || picture->protected_playback || (!inter && !intra) ||
+       codec->qp > 51 || desc->num_ref_idx_l0_active_minus1 || desc->num_ref_idx_l1_active_minus1 ||
+       desc->seq.chroma_format_idc != 1 || desc->seq.bit_depth_luma_minus8 != (ten ? 2 : 0) ||
+       desc->seq.bit_depth_chroma_minus8 != (ten ? 2 : 0))
+      codec->error = -ENOTSUP;
+   if (rate->rate_ctrl_method == PIPE_H2645_ENC_RATE_CONTROL_METHOD_CONSTANT ||
+       rate->rate_ctrl_method == PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE) {
+      unsigned min_qp = rate->app_requested_qp_range ? rate->min_qp : 0;
+      unsigned max_qp = rate->app_requested_qp_range ? MIN2(rate->max_qp, 51) : 51;
+      if (!rate->target_bitrate || min_qp > max_qp) {
+         codec->error = -EINVAL;
+      } else if (rate->rate_ctrl_method != codec->rc_method ||
+                 rate->target_bitrate != codec->rc_target || rate->peak_bitrate != codec->rc_peak ||
+                 min_qp != codec->rc_min_qp || max_qp != codec->rc_max_qp) {
+         nvenc_rc_init(&codec->rc,
+                        rate->rate_ctrl_method == PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE ?
+                           NVENC_RC_VBR : NVENC_RC_CBR,
+                        rate->target_bitrate, rate->peak_bitrate,
+                        rate->frame_rate_num, rate->frame_rate_den, rate->vbv_buffer_size,
+                        min_qp, max_qp, codec->qp);
+         codec->rc_method = rate->rate_ctrl_method;
+         codec->rc_target = rate->target_bitrate;
+         codec->rc_peak = rate->peak_bitrate;
+         codec->rc_min_qp = min_qp;
+         codec->rc_max_qp = max_qp;
+      }
+      codec->qp = nvenc_rc_qp(&codec->rc);
+   } else if (rate->rate_ctrl_method == PIPE_H2645_ENC_RATE_CONTROL_METHOD_DISABLE) {
+      codec->rc_method = rate->rate_ctrl_method;
+   } else {
+      codec->error = -ENOTSUP;
+   }
+   unsigned width = base->width;
+   unsigned height = base->height;
+   if (desc->seq.conformance_window_flag) {
+      unsigned right = 2u * desc->seq.conf_win_right_offset;
+      unsigned bottom = 2u * desc->seq.conf_win_bottom_offset;
+      if (desc->seq.conf_win_left_offset || desc->seq.conf_win_top_offset ||
+          right >= desc->seq.pic_width_in_luma_samples ||
+          bottom >= desc->seq.pic_height_in_luma_samples)
+         codec->error = -ENOTSUP;
+      else {
+         width = desc->seq.pic_width_in_luma_samples - right;
+         height = desc->seq.pic_height_in_luma_samples - bottom;
+      }
+   }
+   unsigned rate_num = rate->frame_rate_num, rate_den = rate->frame_rate_den;
+   if (!codec->error && (!codec->backend || width != codec->backend_width ||
+                        height != codec->backend_height || rate_num != codec->backend_rate_num ||
+                        rate_den != codec->backend_rate_den)) {
+      nvenc_backend_destroy(codec->backend);
+      codec->backend = NULL;
+      codec->error = nvenc_backend_create(nouveau_screen(base->context->screen)->drm->fd,
+                                           width, height, codec->qp, rate_num, rate_den,
+                                           backend_profile(base->profile), &codec->backend);
+      if (!codec->error) {
+         codec->backend_width = width;
+         codec->backend_height = height;
+         codec->backend_rate_num = rate_num;
+         codec->backend_rate_den = rate_den;
+      }
+   }
+   if (picture->out_fence)
+      *picture->out_fence = NULL;
+}
+
+static void
 begin_frame(struct pipe_video_codec *base, struct pipe_video_buffer *target,
             struct pipe_picture_desc *picture)
 {
+   if (nvenc_profile_is_hevc(backend_profile(base->profile))) {
+      begin_hevc_frame(base, target, picture);
+      return;
+   }
    struct nvenc_codec *codec = (struct nvenc_codec *)base;
    struct pipe_h264_enc_picture_desc *desc =
       (struct pipe_h264_enc_picture_desc *)picture;
@@ -255,7 +376,8 @@ surface_usable(const struct nvenc_codec *codec,
 
    const struct nv50_miptree *luma = nv50_miptree(resources[0]);
    const struct nv50_miptree *chroma = nv50_miptree(resources[1]);
-   const unsigned coded_height = align(codec->backend_height, 16);
+   const unsigned coded_height = align(codec->backend_height,
+      nvenc_profile_is_hevc(backend_profile(codec->base.profile)) ? 32 : 16);
    const unsigned pitch = nvenc_backend_pitch(codec->backend);
 
    if (!luma->base.bo || !chroma->base.bo ||
@@ -289,11 +411,11 @@ surface_usable(const struct nvenc_codec *codec,
 
 static bool
 pad_surface(struct pipe_context *pipe, struct pipe_resource *const *resources,
-            unsigned width, unsigned height)
+            unsigned width, unsigned height, unsigned sample_bytes)
 {
    for (unsigned plane = 0; plane < 2; plane++) {
       struct pipe_resource *res = resources[plane];
-      const unsigned bpp = plane ? 2 : 1;
+      const unsigned bpp = (plane ? 2 : 1) * sample_bytes;
       const unsigned visible_w = width >> plane, visible_h = height >> plane;
       const unsigned pad_w = res->width0 - visible_w,
                      pad_h = res->height0 - visible_h;
@@ -366,17 +488,21 @@ encode_bitstream(struct pipe_video_codec *base,
 
    struct nvenc_surface surface;
    if (surface_usable(codec, resources, &surface)) {
-      if (!pad_surface(pipe, resources, codec->backend_width,
-                       codec->backend_height)) {
+       if (!pad_surface(pipe, resources, codec->backend_width,
+                        codec->backend_height,
+                        base->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10 ? 2 : 1)) {
          feedback->error = -EIO;
          return;
       }
       struct pipe_fence_handle *fence = NULL;
       pipe->flush(pipe, &fence, 0);
       if (fence) {
-         pipe->screen->fence_finish(pipe->screen, pipe, fence,
-                                    OS_TIMEOUT_INFINITE);
+         bool ready = pipe->screen->fence_finish(pipe->screen, pipe, fence, 5000000000ull);
          pipe->screen->fence_reference(pipe->screen, &fence, NULL);
+         if (!ready) {
+            feedback->error = -ETIMEDOUT;
+            return;
+         }
       }
       feedback->error = nvenc_backend_submit_surface(
          codec->backend, &surface, codec->qp, codec->is_p_frame, &feedback->ticket);

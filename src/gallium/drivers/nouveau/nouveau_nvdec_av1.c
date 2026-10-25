@@ -118,8 +118,7 @@ nouveau_nvdec_av1_picture(const struct pipe_av1_picture_desc *picture,
        !a->tile_cols || a->tile_cols > 64 || !a->tile_rows || a->tile_rows > 64 ||
        tiles > 256 || picture->slice_parameter.slice_count != tiles ||
        a->context_update_tile_id >= tiles || a->pic_info_fields.large_scale_tile ||
-       a->mode_control_fields.tx_mode > 2 || a->interp_filter > 4 || a->cdef_bits > 3 ||
-       a->film_grain_info.film_grain_info_fields.apply_grain)
+       a->mode_control_fields.tx_mode > 2 || a->interp_filter > 4 || a->cdef_bits > 3)
       return false;
    memset(out, 0, sizeof(*out));
    out->primary = -1;
@@ -127,6 +126,9 @@ nouveau_nvdec_av1_picture(const struct pipe_av1_picture_desc *picture,
    for (unsigned i = 0; i < 3; i++)
       out->projections[i] = -1;
    nvdec_av1_pic_s *p = &out->pic;
+   if (!nouveau_nvdec_av1_film_grain(picture, &p->fgs_cfg, &out->grain))
+      return false;
+   p->enable_fgs = p->fgs_cfg.apply_grain;
    unsigned coded_width = a->frame_width;
    if (a->pic_info_fields.use_superres) {
       if (a->superres_scale_denominator < 9 || a->superres_scale_denominator > 16)

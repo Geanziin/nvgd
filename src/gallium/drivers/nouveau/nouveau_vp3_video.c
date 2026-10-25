@@ -524,6 +524,9 @@ nouveau_vp3_screen_video_supported(struct pipe_screen *screen,
                                    enum pipe_video_profile profile,
                                    enum pipe_video_entrypoint entrypoint)
 {
+   if (entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE &&
+       nouveau_nvenc_param(nouveau_screen(screen), profile, PIPE_VIDEO_CAP_SUPPORTED))
+      return format == (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10 ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12);
    bool native = (profile == PIPE_VIDEO_PROFILE_AV1_MAIN ||
                   profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ||
                   profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10 ||
