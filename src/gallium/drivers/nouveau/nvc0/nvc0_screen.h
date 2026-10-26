@@ -82,6 +82,7 @@ struct nvc0_screen {
    unsigned num_contexts;
    struct nvc0_context *deferred_ctx;
    bool defer_kicks;
+   bool defer_imported;
    /* operations deferred since the last kick before one is forced, so the
     * GPU starts on long frames while the CPU keeps recording (0 = no cap) */
    unsigned defer_batch;

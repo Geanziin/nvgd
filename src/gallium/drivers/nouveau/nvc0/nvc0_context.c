@@ -88,6 +88,7 @@ nvc0_kick_deferred_locked(struct nvc0_screen *screen)
 
    simple_mtx_assert_locked(&screen->state_lock);
    screen->deferred_ctx = NULL;
+   screen->deferred_ops = 0;
    if (prev)
       PUSH_KICK(prev->base.pushbuf);
 }
@@ -128,14 +129,19 @@ nvc0_state_unlock_kick(struct nvc0_context *nvc0)
 
    simple_mtx_assert_locked(&screen->state_lock);
 
-   /* Buffers shared through dma-buf are synchronised by the kernel only once
-    * the commands touching them are submitted.  Chromium/ANGLE exchange
-    * them between separate screens in the same process (GBM, EGL) and with
-    * the compositor, relying on that implicit sync, so never hold such work
-    * back (deferring it made Discord's animated content flicker). */
-   if (screen->defer_kicks && screen->num_contexts == 1 &&
-       !nvc0_should_kick_deferred(screen) &&
-       !nouveau_pushbuf_refs_imported(nvc0->base.pushbuf)) {
+   /* On desktop, buffers shared through dma-buf are synchronised by the kernel
+    * only once the commands touching them are submitted (Chromium/ANGLE/Discord).
+    * On Android, the back buffer is always an imported dma-buf from Gralloc,
+    * which is presented explicitly at eglSwapBuffers() - holding work back
+    * across draws is safe and essential to prevent ioctl flooding.
+    * Multi-context deferral is safe because nvc0_state_lock() flushes any
+    * pending work from another context before that context records commands. */
+   bool can_defer = screen->defer_kicks && !nvc0_should_kick_deferred(screen);
+   if (can_defer && !screen->defer_imported &&
+       nouveau_pushbuf_refs_imported(nvc0->base.pushbuf))
+      can_defer = false;
+
+   if (can_defer) {
       screen->deferred_ctx = nvc0;
    } else {
       PUSH_KICK(nvc0->base.pushbuf);
@@ -152,12 +158,18 @@ nvc0_flush(struct pipe_context *pipe,
            unsigned flags)
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
+   struct nvc0_screen *screen = nvc0->screen;
 
    if (fence)
       nouveau_fence_ref(nvc0->base.fence, (struct nouveau_fence **)fence,
                         nvc0->base.screen);
 
+   simple_mtx_lock(&screen->state_lock);
    PUSH_KICK(nvc0->base.pushbuf); /* fencing handled in kick_notify */
+   screen->deferred_ops = 0;
+   if (screen->deferred_ctx == nvc0)
+      screen->deferred_ctx = NULL;
+   simple_mtx_unlock(&screen->state_lock);
 
    nouveau_context_update_frame_stats(&nvc0->base);
 }
@@ -620,8 +632,7 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
       nvc0->state = screen->save_state;
       screen->cur_ctx = nvc0;
    }
-   /* A second context ends deferral: from now on every operation is kicked
-    * while the lock is held, as upstream does. */
+   /* Flush any pending work from the previous context when a new context joins. */
    if (++screen->num_contexts > 1)
       nvc0_kick_deferred_locked(screen);
    simple_mtx_unlock(&screen->state_lock);
