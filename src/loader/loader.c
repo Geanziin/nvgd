@@ -47,6 +47,7 @@
 #include <GL/gl.h>
 #include "mesa_interface.h"
 #include "loader.h"
+#include "util/detect_os.h"
 #include "util/drm_is_nouveau.h"
 #include "util/libdrm.h"
 #include "util/os_file.h"
@@ -168,7 +169,14 @@ nouveau_zink_predicate(int fd, const char *driver)
    if (!drm_fd_is_nouveau(fd))
       return false;
 
-   bool prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", false);
+#if defined(__ANDROID__) || DETECT_OS_ANDROID
+   /* On Android, use Zink on NVIDIA hardware (nvgd/nouveau) */
+   bool prefer_zink = true;
+#else
+   bool prefer_zink = false;
+#endif
+
+   prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", prefer_zink);
 
    if (prefer_zink && !strcmp(driver, "zink"))
       return true;
