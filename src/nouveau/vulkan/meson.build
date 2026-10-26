@@ -302,6 +302,32 @@ libvulkan_nouveau = shared_library(
   install : true,
 )
 
+libvulkan_nvgd_raw = shared_library(
+  'vulkan.nvgd',
+  name_prefix : '',
+  link_whole : [libnvk],
+  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
+  gnu_symbol_visibility : 'hidden',
+  install : true,
+)
+
+libvulkan_nvgd = shared_library(
+  'vulkan_nvgd',
+  link_whole : [libnvk],
+  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
+  gnu_symbol_visibility : 'hidden',
+  install : true,
+)
+
+libvulkan_nouveau_raw = shared_library(
+  'vulkan.nouveau',
+  name_prefix : '',
+  link_whole : [libnvk],
+  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
+  gnu_symbol_visibility : 'hidden',
+  install : true,
+)
+
 icd_file_name = libname_prefix + 'vulkan_nouveau.' + libname_suffix
 
 nouveau_icd = custom_target(
@@ -339,6 +365,44 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+
+nvgd_icd_file_name = libname_prefix + 'vulkan_nvgd.' + libname_suffix
+
+nvgd_icd = custom_target(
+  'nvgd_icd',
+  input : [vk_icd_gen, vk_api_xml],
+  output : 'nvgd_icd.' + vulkan_manifest_suffix,
+  command : [
+    prog_python, '@INPUT0@',
+    '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
+    '--icd-lib-path', vulkan_icd_lib_path,
+    '--icd-filename', nvgd_icd_file_name,
+    '--out', '@OUTPUT@',
+  ],
+  build_by_default : true,
+  install_dir : with_vulkan_icd_dir,
+  install_tag : 'runtime',
+  install : true,
+)
+
+_dev_nvgd_icdname = 'nvgd_devenv_icd.@0@.json'.format(host_machine.cpu())
+_dev_nvgd_icd = custom_target(
+  'nvgd_devenv_icd',
+  input : [vk_icd_gen, vk_api_xml],
+  output : _dev_nvgd_icdname,
+  command : [
+    prog_python, '@INPUT0@',
+    '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
+    '--icd-lib-path', meson.current_build_dir(),
+    '--icd-filename', nvgd_icd_file_name,
+    '--out', '@OUTPUT@',
+  ],
+  build_by_default : true,
+)
+
+devenv.append('VK_DRIVER_FILES', _dev_nvgd_icd.full_path())
 
 if with_tests and not with_platform_android
   test(
