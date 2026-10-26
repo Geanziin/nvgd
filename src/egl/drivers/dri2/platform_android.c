@@ -1047,13 +1047,6 @@ droid_load_driver(_EGLDisplay *disp, bool swrast)
    if (dri2_dpy->driver_name == NULL)
       return false;
 
-   /* On Android, route nvgd/nouveau to zink */
-   if (strcmp(dri2_dpy->driver_name, "nvgd") == 0 ||
-       strcmp(dri2_dpy->driver_name, "nouveau") == 0) {
-      free(dri2_dpy->driver_name);
-      dri2_dpy->driver_name = strdup("zink");
-   }
-
    if (swrast && !disp->Options.Zink) {
       /* Use kms swrast only with vgem / virtio_gpu.
        * virtio-gpu fallbacks to software rendering when 3D features
