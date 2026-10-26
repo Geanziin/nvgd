@@ -28,6 +28,7 @@
 #include "util/u_screen.h"
 #include "util/u_threaded_context.h"
 #include "pipe/p_screen.h"
+#include "util/detect_os.h"
 
 #include "nouveau_vp3_video.h"
 
@@ -1323,7 +1324,7 @@ nvc0_screen_create(struct nouveau_device *dev)
 
    screen->defer_kicks = debug_get_bool_option("NVGD_DEFER_KICK", true);
    screen->defer_imported = debug_get_bool_option("NVGD_DEFER_IMPORTED",
-#if DETECT_OS_ANDROID
+#if defined(__ANDROID__) || DETECT_OS_ANDROID
                                                   true
 #else
                                                   false

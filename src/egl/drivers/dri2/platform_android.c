@@ -122,7 +122,10 @@ handle_in_fence_fd(struct dri2_egl_surface *dri2_surf, struct dri_image *img)
    if (dri2_dpy->has_native_fence_fd) {
       dri2_set_in_fence_fd(img, dri2_surf->in_fence_fd);
    } else {
-      sync_wait(dri2_surf->in_fence_fd, -1);
+      if (sync_wait(dri2_surf->in_fence_fd, 0) != 0)
+         sync_wait(dri2_surf->in_fence_fd, 50);
+      close(dri2_surf->in_fence_fd);
+      dri2_surf->in_fence_fd = -1;
    }
 }
 
@@ -170,6 +173,10 @@ droid_window_dequeue_buffer(struct dri2_egl_surface *dri2_surf)
        * the color_buffers
        */
       for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
+         if (dri2_surf->color_buffers[i].dri_image) {
+            dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
+            dri2_surf->color_buffers[i].dri_image = NULL;
+         }
          dri2_surf->color_buffers[i].buffer = NULL;
          dri2_surf->color_buffers[i].age = 0;
       }
@@ -200,11 +207,7 @@ droid_window_enqueue_buffer(_EGLDisplay *disp,
 
    dri2_surf->buffer = NULL;
    dri2_surf->back = NULL;
-
-   if (dri2_surf->dri_image_back) {
-      dri2_destroy_image(dri2_surf->dri_image_back);
-      dri2_surf->dri_image_back = NULL;
-   }
+   dri2_surf->dri_image_back = NULL;
 
    return EGL_TRUE;
 }
@@ -399,12 +402,17 @@ droid_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       ANativeWindow_release(dri2_surf->window);
    }
 
-   if (dri2_surf->dri_image_back) {
-      _eglLog(_EGL_DEBUG, "%s : %d : destroy dri_image_back", __func__,
-              __LINE__);
-      dri2_destroy_image(dri2_surf->dri_image_back);
-      dri2_surf->dri_image_back = NULL;
+   if (dri2_surf->color_buffers) {
+      for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
+         if (dri2_surf->color_buffers[i].dri_image) {
+            dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
+            dri2_surf->color_buffers[i].dri_image = NULL;
+         }
+      }
+      free(dri2_surf->color_buffers);
+      dri2_surf->color_buffers = NULL;
    }
+   dri2_surf->dri_image_back = NULL;
 
    if (dri2_surf->dri_image_front) {
       _eglLog(_EGL_DEBUG, "%s : %d : destroy dri_image_front", __func__,
@@ -417,7 +425,6 @@ droid_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 
    close_in_fence_fd(dri2_surf);
    dri2_fini_surface(surf);
-   free(dri2_surf->color_buffers);
    free(dri2_surf);
 
    return EGL_TRUE;
@@ -457,6 +464,17 @@ update_buffers(struct dri2_egl_surface *dri2_surf)
        dri2_surf->base.Height != dri2_surf->buffer->height) {
       dri2_surf->base.Width = dri2_surf->buffer->width;
       dri2_surf->base.Height = dri2_surf->buffer->height;
+      if (dri2_surf->color_buffers) {
+         for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
+            if (dri2_surf->color_buffers[i].dri_image) {
+               dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
+               dri2_surf->color_buffers[i].dri_image = NULL;
+            }
+            dri2_surf->color_buffers[i].buffer = NULL;
+            dri2_surf->color_buffers[i].age = 0;
+         }
+      }
+      dri2_surf->dri_image_back = NULL;
    }
 
    return 0;
@@ -507,11 +525,17 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
          return -1;
       }
 
-      dri2_surf->dri_image_back =
-         droid_create_image_from_native_buffer(disp, dri2_surf->buffer, NULL);
-      if (!dri2_surf->dri_image_back) {
-         _eglLog(_EGL_WARNING, "failed to create DRI image from FD");
-         return -1;
+      if (dri2_surf->back && dri2_surf->back->dri_image) {
+         dri2_surf->dri_image_back = dri2_surf->back->dri_image;
+      } else {
+         dri2_surf->dri_image_back =
+            droid_create_image_from_native_buffer(disp, dri2_surf->buffer, NULL);
+         if (!dri2_surf->dri_image_back) {
+            _eglLog(_EGL_WARNING, "failed to create DRI image from FD");
+            return -1;
+         }
+         if (dri2_surf->back)
+            dri2_surf->back->dri_image = dri2_surf->dri_image_back;
       }
 
       handle_in_fence_fd(dri2_surf, dri2_surf->dri_image_back);
@@ -934,6 +958,8 @@ droid_display_shared_buffer(struct dri_drawable *driDrawable, int fence_fd,
       dri2_surf->back = NULL;
 
       if (dri2_surf->dri_image_back) {
+         if (dri2_surf->back && dri2_surf->back->dri_image == dri2_surf->dri_image_back)
+            dri2_surf->back->dri_image = NULL;
          dri2_destroy_image(dri2_surf->dri_image_back);
          dri2_surf->dri_image_back = NULL;
       }
