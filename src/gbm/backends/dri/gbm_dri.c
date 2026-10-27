@@ -280,10 +280,19 @@ dri_screen_create(struct gbm_dri_device *dri)
    if (!driver_name)
       return -1;
 
+   /* On Android or hardware drivers, GBM requires a real hardware Gallium driver
+    * (nvgd/nouveau) to allocate DRM GEM BOs for gralloc.gbm, since Zink is a
+    * Vulkan translation layer and cannot allocate kernel DRM GEM BOs directly.
+    */
+   if (!strcmp(driver_name, "zink")) {
+      free(driver_name);
+      driver_name = strdup("nvgd");
+   }
+
    ret = dri_screen_create_for_driver(dri, driver_name, /*driver_name_is_inferred=*/false);
    if (ret) {
       /* Note: driver_name freed by called function */
-      driver_name = strdup("zink");
+      driver_name = strdup("nouveau");
       ret = dri_screen_create_for_driver(dri, driver_name, /*driver_name_is_inferred=*/true);
    }
 
