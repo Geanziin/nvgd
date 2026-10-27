@@ -122,8 +122,22 @@ handle_in_fence_fd(struct dri2_egl_surface *dri2_surf, struct dri_image *img)
    if (dri2_dpy->has_native_fence_fd) {
       dri2_set_in_fence_fd(img, dri2_surf->in_fence_fd);
    } else {
-      if (sync_wait(dri2_surf->in_fence_fd, 0) != 0)
-         sync_wait(dri2_surf->in_fence_fd, 50);
+      /* Spin-poll briefly to catch fences that signal almost immediately
+       * without entering kernel sleep/wake latency.
+       */
+      int signaled = -1;
+      for (int i = 0; i < 60; i++) {
+         if (sync_wait(dri2_surf->in_fence_fd, 0) == 0) {
+            signaled = 0;
+            break;
+         }
+      }
+      if (signaled != 0) {
+         /* Cap wait timeout to 2ms (within the 4.16ms 240Hz frame budget)
+          * rather than stalling for 50ms.
+          */
+         sync_wait(dri2_surf->in_fence_fd, 2);
+      }
       close(dri2_surf->in_fence_fd);
       dri2_surf->in_fence_fd = -1;
    }
