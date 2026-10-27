@@ -689,7 +689,7 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
       nvc0->dirty_cp |= NVC0_NEW_CP_SAMPLERS;
    }
 
-   const bool use_tc = debug_get_bool_option("NVGD_THREADED_CONTEXT", false);
+   const bool use_tc = debug_get_bool_option("NVGD_THREADED_CONTEXT", true);
    if (!use_tc)
       return pipe;
 
