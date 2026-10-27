@@ -125,36 +125,10 @@ handle_in_fence_fd(struct dri2_egl_surface *dri2_surf, struct dri_image *img)
       return;
    }
 
-   /* If the buffer is a DMA-BUF, import the in-fence directly into the kernel's
-    * dma_resv object via DMA_BUF_IOCTL_IMPORT_SYNC_FILE. The kernel DRM driver
-    * will automatically schedule GPU execution to wait on this fence in hardware
-    * without blocking the CPU render thread.
+   /* On Android without native fence fd support (nvc0/nvgd):
+    * Never stall the CPU render loop with sync_wait. Close the in-fence
+    * immediately to allow CPU and GPU to execute fully asynchronously.
     */
-   if (dri2_surf->buffer) {
-      struct u_gralloc_buffer_basic_info buf_info;
-      struct u_gralloc_buffer_handle gr_handle = {
-         .handle = dri2_surf->buffer->handle,
-         .hal_format = dri2_surf->buffer->format,
-         .pixel_stride = dri2_surf->buffer->stride,
-      };
-      if (u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc, &gr_handle, &buf_info) == 0 &&
-          buf_info.num_planes > 0 && buf_info.fds[0] >= 0) {
-         struct dma_buf_import_sync_file import_sync = {
-            .flags = DMA_BUF_SYNC_WRITE,
-            .fd = dri2_surf->in_fence_fd,
-         };
-         if (drmIoctl(buf_info.fds[0], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import_sync) == 0) {
-            close(dri2_surf->in_fence_fd);
-            dri2_surf->in_fence_fd = -1;
-            return;
-         }
-      }
-   }
-
-   /* Fallback: fast non-blocking sync check; never stall the CPU render loop */
-   if (sync_wait(dri2_surf->in_fence_fd, 0) != 0) {
-      sync_wait(dri2_surf->in_fence_fd, 1);
-   }
    close(dri2_surf->in_fence_fd);
    dri2_surf->in_fence_fd = -1;
 }
@@ -221,33 +195,8 @@ static EGLBoolean
 droid_window_enqueue_buffer(_EGLDisplay *disp,
                             struct dri2_egl_surface *dri2_surf)
 {
-   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    int fence_fd = dri2_surf->out_fence_fd;
    dri2_surf->out_fence_fd = -1;
-
-   /* If no out_fence_fd was provided by the EGL extension, export the GPU fence
-    * directly from the DMA-BUF using DMA_BUF_IOCTL_EXPORT_SYNC_FILE.
-    * This tells SurfaceFlinger and the hardware compositor that the buffer has an
-    * explicit hardware sync fence, avoiding compositor-side stalls.
-    */
-   if (fence_fd < 0 && dri2_surf->buffer) {
-      struct u_gralloc_buffer_basic_info buf_info;
-      struct u_gralloc_buffer_handle gr_handle = {
-         .handle = dri2_surf->buffer->handle,
-         .hal_format = dri2_surf->buffer->format,
-         .pixel_stride = dri2_surf->buffer->stride,
-      };
-      if (u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc, &gr_handle, &buf_info) == 0 &&
-          buf_info.num_planes > 0 && buf_info.fds[0] >= 0) {
-         struct dma_buf_export_sync_file export_sync = {
-            .flags = DMA_BUF_SYNC_WRITE,
-            .fd = -1,
-         };
-         if (drmIoctl(buf_info.fds[0], DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export_sync) == 0) {
-            fence_fd = export_sync.fd;
-         }
-      }
-   }
 
    ANativeWindow_queueBuffer(dri2_surf->window, dri2_surf->buffer, fence_fd);
 
@@ -1092,6 +1041,20 @@ droid_load_driver(_EGLDisplay *disp, bool swrast)
       dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
    if (dri2_dpy->driver_name == NULL)
       return false;
+
+   if (strcmp(dri2_dpy->driver_name, "nvgd") == 0 ||
+       strcmp(dri2_dpy->driver_name, "nouveau") == 0) {
+      char prop_zink[PROP_VALUE_MAX] = {0};
+      bool use_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", false);
+      if (__system_property_get("debug.mesa.zink", prop_zink) > 0 &&
+          (strcmp(prop_zink, "1") == 0 || strcmp(prop_zink, "true") == 0)) {
+         use_zink = true;
+      }
+      if (use_zink) {
+         free(dri2_dpy->driver_name);
+         dri2_dpy->driver_name = strdup("zink");
+      }
+   }
 
    if (swrast && !disp->Options.Zink) {
       /* Use kms swrast only with vgem / virtio_gpu.
