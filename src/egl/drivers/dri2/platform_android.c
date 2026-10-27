@@ -36,6 +36,7 @@
 #include "util/libdrm.h"
 #include <sys/system_properties.h>
 #include <drm-uapi/drm_fourcc.h>
+#include <linux/dma-buf.h>
 #include <sync/sync.h>
 #include <sys/types.h>
 
@@ -121,26 +122,41 @@ handle_in_fence_fd(struct dri2_egl_surface *dri2_surf, struct dri_image *img)
 
    if (dri2_dpy->has_native_fence_fd) {
       dri2_set_in_fence_fd(img, dri2_surf->in_fence_fd);
-   } else {
-      /* Spin-poll briefly to catch fences that signal almost immediately
-       * without entering kernel sleep/wake latency.
-       */
-      int signaled = -1;
-      for (int i = 0; i < 60; i++) {
-         if (sync_wait(dri2_surf->in_fence_fd, 0) == 0) {
-            signaled = 0;
-            break;
+      return;
+   }
+
+   /* If the buffer is a DMA-BUF, import the in-fence directly into the kernel's
+    * dma_resv object via DMA_BUF_IOCTL_IMPORT_SYNC_FILE. The kernel DRM driver
+    * will automatically schedule GPU execution to wait on this fence in hardware
+    * without blocking the CPU render thread.
+    */
+   if (dri2_surf->buffer) {
+      struct u_gralloc_buffer_basic_info buf_info;
+      struct u_gralloc_buffer_handle gr_handle = {
+         .handle = dri2_surf->buffer->handle,
+         .hal_format = dri2_surf->buffer->format,
+         .pixel_stride = dri2_surf->buffer->stride,
+      };
+      if (u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc, &gr_handle, &buf_info) == 0 &&
+          buf_info.num_planes > 0 && buf_info.fds[0] >= 0) {
+         struct dma_buf_import_sync_file import_sync = {
+            .flags = DMA_BUF_SYNC_WRITE,
+            .fd = dri2_surf->in_fence_fd,
+         };
+         if (drmIoctl(buf_info.fds[0], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import_sync) == 0) {
+            close(dri2_surf->in_fence_fd);
+            dri2_surf->in_fence_fd = -1;
+            return;
          }
       }
-      if (signaled != 0) {
-         /* Cap wait timeout to 2ms (within the 4.16ms 240Hz frame budget)
-          * rather than stalling for 50ms.
-          */
-         sync_wait(dri2_surf->in_fence_fd, 2);
-      }
-      close(dri2_surf->in_fence_fd);
-      dri2_surf->in_fence_fd = -1;
    }
+
+   /* Fallback: fast non-blocking sync check; never stall the CPU render loop */
+   if (sync_wait(dri2_surf->in_fence_fd, 0) != 0) {
+      sync_wait(dri2_surf->in_fence_fd, 1);
+   }
+   close(dri2_surf->in_fence_fd);
+   dri2_surf->in_fence_fd = -1;
 }
 
 static void
@@ -205,18 +221,34 @@ static EGLBoolean
 droid_window_enqueue_buffer(_EGLDisplay *disp,
                             struct dri2_egl_surface *dri2_surf)
 {
-   /* Queue the buffer with stored out fence fd. The ANativeWindow or buffer
-    * consumer may choose to wait for the fence to signal before accessing
-    * it. If fence fd value is -1, buffer can be accessed by consumer
-    * immediately. Consumer or application shouldn't rely on timestamp
-    * associated with fence if the fence fd is -1.
-    *
-    * Ownership of fd is transferred to consumer after queueBuffer and the
-    * consumer is responsible for closing it. Caller must not use the fd
-    * after passing it to queueBuffer.
-    */
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    int fence_fd = dri2_surf->out_fence_fd;
    dri2_surf->out_fence_fd = -1;
+
+   /* If no out_fence_fd was provided by the EGL extension, export the GPU fence
+    * directly from the DMA-BUF using DMA_BUF_IOCTL_EXPORT_SYNC_FILE.
+    * This tells SurfaceFlinger and the hardware compositor that the buffer has an
+    * explicit hardware sync fence, avoiding compositor-side stalls.
+    */
+   if (fence_fd < 0 && dri2_surf->buffer) {
+      struct u_gralloc_buffer_basic_info buf_info;
+      struct u_gralloc_buffer_handle gr_handle = {
+         .handle = dri2_surf->buffer->handle,
+         .hal_format = dri2_surf->buffer->format,
+         .pixel_stride = dri2_surf->buffer->stride,
+      };
+      if (u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc, &gr_handle, &buf_info) == 0 &&
+          buf_info.num_planes > 0 && buf_info.fds[0] >= 0) {
+         struct dma_buf_export_sync_file export_sync = {
+            .flags = DMA_BUF_SYNC_WRITE,
+            .fd = -1,
+         };
+         if (drmIoctl(buf_info.fds[0], DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export_sync) == 0) {
+            fence_fd = export_sync.fd;
+         }
+      }
+   }
+
    ANativeWindow_queueBuffer(dri2_surf->window, dri2_surf->buffer, fence_fd);
 
    dri2_surf->buffer = NULL;
