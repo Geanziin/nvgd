@@ -47,6 +47,10 @@
 #include <GL/gl.h>
 #include "mesa_interface.h"
 #include "loader.h"
+#include "util/detect_os.h"
+#if defined(__ANDROID__) || DETECT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 #include "util/drm_is_nouveau.h"
 #include "util/libdrm.h"
 #include "util/os_file.h"
@@ -168,7 +172,22 @@ nouveau_zink_predicate(int fd, const char *driver)
    if (!drm_fd_is_nouveau(fd))
       return false;
 
-   bool prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", false);
+#if defined(__ANDROID__) || DETECT_OS_ANDROID
+   /* On Android, use Zink over NVK by default to match upstream 240 FPS behavior */
+   bool prefer_zink = true;
+   char prop_zink[PROP_VALUE_MAX] = {0};
+   if (__system_property_get("debug.mesa.zink", prop_zink) > 0) {
+      if (!strcmp(prop_zink, "0") || !strcasecmp(prop_zink, "false"))
+         prefer_zink = false;
+      else if (!strcmp(prop_zink, "1") || !strcasecmp(prop_zink, "true"))
+         prefer_zink = true;
+   }
+#else
+   /* On Desktop host Linux, use direct hardware driver (nvgd) */
+   bool prefer_zink = false;
+#endif
+
+   prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", prefer_zink);
 
    if (prefer_zink && !strcmp(driver, "zink"))
       return true;
