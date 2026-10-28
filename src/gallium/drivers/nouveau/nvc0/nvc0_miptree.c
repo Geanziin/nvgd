@@ -216,7 +216,7 @@ nvc0_mt_choose_storage_type(struct pipe_screen *pscreen,
        !(mt->base.base.bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
                                PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
        mt->base.base.usage != PIPE_USAGE_STAGING &&
-       debug_get_bool_option("NVGD_COLOR_COMPRESSION", true))
+       debug_get_bool_option("NVGD_COLOR_COMPRESSION", false))
       return 0x08; /* NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE */
 
    return nvc0_choose_tiled_storage_type(pscreen, mt->base.base.format, ms, compressed);
