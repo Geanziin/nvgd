@@ -371,7 +371,6 @@ struct dri2_egl_surface {
    int color_buffers_count;
    struct {
       struct ANativeWindowBuffer *buffer;
-      struct dri_image *dri_image;
       int age;
    } *color_buffers, *back;
    uint32_t gralloc_usage;

@@ -36,7 +36,6 @@
 #include "util/libdrm.h"
 #include <sys/system_properties.h>
 #include <drm-uapi/drm_fourcc.h>
-#include <linux/dma-buf.h>
 #include <sync/sync.h>
 #include <sys/types.h>
 
@@ -122,15 +121,9 @@ handle_in_fence_fd(struct dri2_egl_surface *dri2_surf, struct dri_image *img)
 
    if (dri2_dpy->has_native_fence_fd) {
       dri2_set_in_fence_fd(img, dri2_surf->in_fence_fd);
-      return;
+   } else {
+      sync_wait(dri2_surf->in_fence_fd, -1);
    }
-
-   /* On Android without native fence fd support (nvc0/nvgd):
-    * Never stall the CPU render loop with sync_wait. Close the in-fence
-    * immediately to allow CPU and GPU to execute fully asynchronously.
-    */
-   close(dri2_surf->in_fence_fd);
-   dri2_surf->in_fence_fd = -1;
 }
 
 static void
@@ -177,10 +170,6 @@ droid_window_dequeue_buffer(struct dri2_egl_surface *dri2_surf)
        * the color_buffers
        */
       for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
-         if (dri2_surf->color_buffers[i].dri_image) {
-            dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
-            dri2_surf->color_buffers[i].dri_image = NULL;
-         }
          dri2_surf->color_buffers[i].buffer = NULL;
          dri2_surf->color_buffers[i].age = 0;
       }
@@ -195,14 +184,27 @@ static EGLBoolean
 droid_window_enqueue_buffer(_EGLDisplay *disp,
                             struct dri2_egl_surface *dri2_surf)
 {
+   /* Queue the buffer with stored out fence fd. The ANativeWindow or buffer
+    * consumer may choose to wait for the fence to signal before accessing
+    * it. If fence fd value is -1, buffer can be accessed by consumer
+    * immediately. Consumer or application shouldn't rely on timestamp
+    * associated with fence if the fence fd is -1.
+    *
+    * Ownership of fd is transferred to consumer after queueBuffer and the
+    * consumer is responsible for closing it. Caller must not use the fd
+    * after passing it to queueBuffer.
+    */
    int fence_fd = dri2_surf->out_fence_fd;
    dri2_surf->out_fence_fd = -1;
-
    ANativeWindow_queueBuffer(dri2_surf->window, dri2_surf->buffer, fence_fd);
 
    dri2_surf->buffer = NULL;
    dri2_surf->back = NULL;
-   dri2_surf->dri_image_back = NULL;
+
+   if (dri2_surf->dri_image_back) {
+      dri2_destroy_image(dri2_surf->dri_image_back);
+      dri2_surf->dri_image_back = NULL;
+   }
 
    return EGL_TRUE;
 }
@@ -397,17 +399,12 @@ droid_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       ANativeWindow_release(dri2_surf->window);
    }
 
-   if (dri2_surf->color_buffers) {
-      for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
-         if (dri2_surf->color_buffers[i].dri_image) {
-            dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
-            dri2_surf->color_buffers[i].dri_image = NULL;
-         }
-      }
-      free(dri2_surf->color_buffers);
-      dri2_surf->color_buffers = NULL;
+   if (dri2_surf->dri_image_back) {
+      _eglLog(_EGL_DEBUG, "%s : %d : destroy dri_image_back", __func__,
+              __LINE__);
+      dri2_destroy_image(dri2_surf->dri_image_back);
+      dri2_surf->dri_image_back = NULL;
    }
-   dri2_surf->dri_image_back = NULL;
 
    if (dri2_surf->dri_image_front) {
       _eglLog(_EGL_DEBUG, "%s : %d : destroy dri_image_front", __func__,
@@ -420,6 +417,7 @@ droid_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 
    close_in_fence_fd(dri2_surf);
    dri2_fini_surface(surf);
+   free(dri2_surf->color_buffers);
    free(dri2_surf);
 
    return EGL_TRUE;
@@ -459,17 +457,6 @@ update_buffers(struct dri2_egl_surface *dri2_surf)
        dri2_surf->base.Height != dri2_surf->buffer->height) {
       dri2_surf->base.Width = dri2_surf->buffer->width;
       dri2_surf->base.Height = dri2_surf->buffer->height;
-      if (dri2_surf->color_buffers) {
-         for (int i = 0; i < dri2_surf->color_buffers_count; i++) {
-            if (dri2_surf->color_buffers[i].dri_image) {
-               dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
-               dri2_surf->color_buffers[i].dri_image = NULL;
-            }
-            dri2_surf->color_buffers[i].buffer = NULL;
-            dri2_surf->color_buffers[i].age = 0;
-         }
-      }
-      dri2_surf->dri_image_back = NULL;
    }
 
    return 0;
@@ -520,17 +507,11 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
          return -1;
       }
 
-      if (dri2_surf->back && dri2_surf->back->dri_image) {
-         dri2_surf->dri_image_back = dri2_surf->back->dri_image;
-      } else {
-         dri2_surf->dri_image_back =
-            droid_create_image_from_native_buffer(disp, dri2_surf->buffer, NULL);
-         if (!dri2_surf->dri_image_back) {
-            _eglLog(_EGL_WARNING, "failed to create DRI image from FD");
-            return -1;
-         }
-         if (dri2_surf->back)
-            dri2_surf->back->dri_image = dri2_surf->dri_image_back;
+      dri2_surf->dri_image_back =
+         droid_create_image_from_native_buffer(disp, dri2_surf->buffer, NULL);
+      if (!dri2_surf->dri_image_back) {
+         _eglLog(_EGL_WARNING, "failed to create DRI image from FD");
+         return -1;
       }
 
       handle_in_fence_fd(dri2_surf, dri2_surf->dri_image_back);
@@ -953,8 +934,6 @@ droid_display_shared_buffer(struct dri_drawable *driDrawable, int fence_fd,
       dri2_surf->back = NULL;
 
       if (dri2_surf->dri_image_back) {
-         if (dri2_surf->back && dri2_surf->back->dri_image == dri2_surf->dri_image_back)
-            dri2_surf->back->dri_image = NULL;
          dri2_destroy_image(dri2_surf->dri_image_back);
          dri2_surf->dri_image_back = NULL;
       }
@@ -1041,20 +1020,6 @@ droid_load_driver(_EGLDisplay *disp, bool swrast)
       dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
    if (dri2_dpy->driver_name == NULL)
       return false;
-
-   if (strcmp(dri2_dpy->driver_name, "nvgd") == 0 ||
-       strcmp(dri2_dpy->driver_name, "nouveau") == 0) {
-      char prop_zink[PROP_VALUE_MAX] = {0};
-      bool use_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", false);
-      if (__system_property_get("debug.mesa.zink", prop_zink) > 0 &&
-          (strcmp(prop_zink, "1") == 0 || strcmp(prop_zink, "true") == 0)) {
-         use_zink = true;
-      }
-      if (use_zink) {
-         free(dri2_dpy->driver_name);
-         dri2_dpy->driver_name = strdup("zink");
-      }
-   }
 
    if (swrast && !disp->Options.Zink) {
       /* Use kms swrast only with vgem / virtio_gpu.

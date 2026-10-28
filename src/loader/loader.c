@@ -47,10 +47,6 @@
 #include <GL/gl.h>
 #include "mesa_interface.h"
 #include "loader.h"
-#include "util/detect_os.h"
-#if defined(__ANDROID__) || DETECT_OS_ANDROID
-#include <sys/system_properties.h>
-#endif
 #include "util/drm_is_nouveau.h"
 #include "util/libdrm.h"
 #include "util/os_file.h"
@@ -172,27 +168,52 @@ nouveau_zink_predicate(int fd, const char *driver)
    if (!drm_fd_is_nouveau(fd))
       return false;
 
-#if defined(__ANDROID__) || DETECT_OS_ANDROID
-   /* On Android, use Zink over NVK by default to match upstream 240 FPS behavior */
-   bool prefer_zink = true;
-   char prop_zink[PROP_VALUE_MAX] = {0};
-   if (__system_property_get("debug.mesa.zink", prop_zink) > 0) {
-      if (!strcmp(prop_zink, "0") || !strcasecmp(prop_zink, "false"))
-         prefer_zink = false;
-      else if (!strcmp(prop_zink, "1") || !strcasecmp(prop_zink, "true"))
-         prefer_zink = true;
-   }
-#else
-   /* On Desktop host Linux, use direct hardware driver (nvgd) */
    bool prefer_zink = false;
-#endif
+   bool require_zink = false;
+
+   /* Enable Zink by default on Turing and later GPUs
+    *
+    * We only use Zink if if the kernel supports VMA_TILEMODE, which is needed
+    * for DRM format modifiers.  This also doubles as a check for a new enough
+    * kernel to run NVK in general.
+    */
+   struct drm_nouveau_getparam r = { .param = NOUVEAU_GETPARAM_HAS_VMA_TILEMODE };
+   int ret = drmCommandWriteRead(fd, DRM_NOUVEAU_GETPARAM, &r, sizeof(r));
+   if (ret == 0 && r.value == 1) {
+      r.param = NOUVEAU_GETPARAM_CHIPSET_ID;
+      r.value = 0;
+      ret = drmCommandWriteRead(fd, DRM_NOUVEAU_GETPARAM, &r, sizeof(r));
+      if (ret == 0 && r.value >= 0x160) {
+         prefer_zink = true;
+      }
+      /* Nouveau GL isn't enabled on anything after Ada */
+      if (ret == 0 && r.value >= 0x1a0) {
+         require_zink = true;
+      }
+   }
+   assert(!require_zink || prefer_zink);
 
    prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", prefer_zink);
 
-   if (prefer_zink && !strcmp(driver, "zink"))
+   bool use_zink = prefer_zink;
+   if (require_zink) {
+      /* nouveau_zink_predicate() typically gets called twice but we only want
+       * to warn once.
+       */
+      static bool warned = false;
+      if (!prefer_zink && !warned) {
+         log_(_LOADER_WARNING,
+              "NOUVEAU_USE_ZINK is ignored for Blackwell and later GPUs.\n");
+         warned = true;
+      }
+
+      use_zink = true;
+   }
+
+   if (use_zink && !strcmp(driver, "zink"))
       return true;
 
-   if (!prefer_zink && (!strcmp(driver, "nvgd") || !strcmp(driver, "nouveau")))
+   if (!use_zink && (!strcmp(driver, "nvgd") || !strcmp(driver, "nouveau")))
       return true;
    return false;
 #endif

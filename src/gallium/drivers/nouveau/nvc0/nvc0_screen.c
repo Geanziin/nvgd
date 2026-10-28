@@ -1323,20 +1323,9 @@ nvc0_screen_create(struct nouveau_device *dev)
                                         screen->copy ? screen->copy->oclass : 0);
 
    screen->defer_kicks = debug_get_bool_option("NVGD_DEFER_KICK", true);
-   screen->defer_imported = debug_get_bool_option("NVGD_DEFER_IMPORTED",
-#if defined(__ANDROID__) || DETECT_OS_ANDROID
-                                                  true
-#else
-                                                  false
-#endif
-   );
-#if defined(__ANDROID__) || DETECT_OS_ANDROID
-   screen->defer_batch = debug_get_num_option("NVGD_KICK_BATCH", 16);
-   screen->defer_idle_min = debug_get_num_option("NVGD_KICK_IDLE_MIN", 4);
-#else
+   screen->defer_imported = debug_get_bool_option("NVGD_DEFER_IMPORTED", false);
    screen->defer_batch = debug_get_num_option("NVGD_KICK_BATCH", 256);
    screen->defer_idle_min = debug_get_num_option("NVGD_KICK_IDLE_MIN", 96);
-#endif
 
    const bool use_nak = debug_get_bool_option("NVGD_USE_NAK", true);
    if (use_nak && dev->chipset >= 0x160) {
