@@ -444,10 +444,6 @@ nv50_miptree_from_handle(struct pipe_screen *pscreen,
    return &mt->base.base;
 }
 
-   /* no need to adjust bo reference count */
-   return &mt->base.base;
-}
-
 
 /* Offset of zslice @z from start of level @l. */
 inline unsigned
