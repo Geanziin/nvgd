@@ -267,12 +267,6 @@ nvc0_resource_copy_region(struct pipe_context *pipe,
    assert(nv50_2d_dst_format_faithful(dst->format));
    assert(nv50_2d_src_format_faithful(src->format));
 
-   if (nvc0->screen->eng3d->oclass >= TU102_3D_CLASS) {
-      util_resource_copy_region(pipe, dst, dst_level, dstx, dsty, dstz,
-                                src, src_level, src_box);
-      return;
-   }
-
    BCTX_REFN(nvc0->bufctx, 2D, nv04_resource(src), RD);
    BCTX_REFN(nvc0->bufctx, 2D, nv04_resource(dst), WR);
    nouveau_pushbuf_bufctx(nvc0->base.pushbuf, nvc0->bufctx);
@@ -1517,15 +1511,6 @@ nvc0_blit_eng2d(struct nvc0_context *nvc0, const struct pipe_blit_info *info)
    nvc0_2d_texture_set(push, 1, dst, info->dst.level, dz, info->dst.format, b);
    nvc0_2d_texture_set(push, 0, src, info->src.level, sz, info->src.format, b);
 
-   if (info->scissor_enable && nvc0->screen->eng3d->oclass < TU102_3D_CLASS) {
-      BEGIN_NVC0(push, NVC0_2D(CLIP_X), 5);
-      PUSH_DATA (push, info->scissor.minx << dst->ms_x);
-      PUSH_DATA (push, info->scissor.miny << dst->ms_y);
-      PUSH_DATA (push, (info->scissor.maxx - info->scissor.minx) << dst->ms_x);
-      PUSH_DATA (push, (info->scissor.maxy - info->scissor.miny) << dst->ms_y);
-      PUSH_DATA (push, 1); /* enable */
-   }
-
    if (nvc0->cond_query && info->render_condition_enable)
       IMMED_NVC0(push, NVC0_2D(COND_MODE), nvc0->cond_condmode);
 
@@ -1655,12 +1640,53 @@ nvc0_blit_eng2d(struct nvc0_context *nvc0, const struct pipe_blit_info *info)
 
    nouveau_bufctx_reset(nvc0->bufctx, NVC0_BIND_2D);
 
-   if (info->scissor_enable && nvc0->screen->eng3d->oclass < TU102_3D_CLASS)
-      IMMED_NVC0(push, NVC0_2D(CLIP_ENABLE), 0);
    if (mask != 0xffffffff)
       IMMED_NVC0(push, NVC0_2D(OPERATION), NV50_2D_OPERATION_SRCCOPY);
    if (nvc0->cond_query && info->render_condition_enable)
       IMMED_NVC0(push, NVC0_2D(COND_MODE), NV50_2D_COND_MODE_ALWAYS);
+}
+
+static bool
+nvc0_blit_clip_scissor(struct pipe_blit_info *info)
+{
+   if (!info->scissor_enable)
+      return true;
+
+   int minx = MAX2(info->dst.box.x, (int)info->scissor.minx);
+   int maxx = MIN2(info->dst.box.x + info->dst.box.width, (int)info->scissor.maxx);
+   int miny = MAX2(info->dst.box.y, (int)info->scissor.miny);
+   int maxy = MIN2(info->dst.box.y + info->dst.box.height, (int)info->scissor.maxy);
+
+   if (maxx <= minx || maxy <= miny)
+      return false;
+
+   /* Scaled blits go through nvc0_blit_3d, which applies the scissor
+    * itself.  Only unscaled blits (possibly mirrored on either axis) can
+    * reach the 2D engine, which no longer programs its CLIP rectangle, so
+    * those must be clipped here.  Mirrored axes have a negative source
+    * extent: the source start moves the other way when the left/bottom
+    * edge of the destination is clipped. */
+   const bool flip_x = info->src.box.width == -info->dst.box.width;
+   const bool flip_y = info->src.box.height == -info->dst.box.height;
+   if ((info->src.box.width != info->dst.box.width && !flip_x) ||
+       (info->src.box.height != info->dst.box.height && !flip_y))
+      return true;
+
+   int dx0 = minx - info->dst.box.x;
+   int dy0 = miny - info->dst.box.y;
+   int new_w = maxx - minx;
+   int new_h = maxy - miny;
+
+   info->src.box.x += flip_x ? -dx0 : dx0;
+   info->src.box.y += flip_y ? -dy0 : dy0;
+   info->src.box.width = flip_x ? -new_w : new_w;
+   info->src.box.height = flip_y ? -new_h : new_h;
+   info->dst.box.x = minx;
+   info->dst.box.y = miny;
+   info->dst.box.width = new_w;
+   info->dst.box.height = new_h;
+   info->scissor_enable = false;
+   return true;
 }
 
 static void
@@ -1668,7 +1694,12 @@ nvc0_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
-   bool eng3d = nvc0->screen->eng3d->oclass >= TU102_3D_CLASS;
+   struct pipe_blit_info blit_info = *info;
+   bool eng3d = false;
+
+   if (!nvc0_blit_clip_scissor(&blit_info))
+      return;
+   info = &blit_info;
 
    if (info->src.box.width == 0 || info->src.box.height == 0 ||
        info->dst.box.width == 0 || info->dst.box.height == 0) {
