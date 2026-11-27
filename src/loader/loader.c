@@ -168,52 +168,22 @@ nouveau_zink_predicate(int fd, const char *driver)
    if (!drm_fd_is_nouveau(fd))
       return false;
 
-   bool prefer_zink = false;
-   bool require_zink = false;
-
-   /* Enable Zink by default on Turing and later GPUs
-    *
-    * We only use Zink if if the kernel supports VMA_TILEMODE, which is needed
-    * for DRM format modifiers.  This also doubles as a check for a new enough
-    * kernel to run NVK in general.
+   /* nvgd lab: Zink only when explicitly requested (NOUVEAU_USE_ZINK=1).
+    * Upstream defaults to Zink on Turing+ (chipset >= 0x160) with
+    * VMA_TILEMODE, but that breaks the VA-API path: the video probe
+    * (pipe_loader_drm) only overrides zink -> nouveau for GA107, so on
+    * Ada the Gallium screen stays zink, which has no video support.
+    * This restores the mesa -1 (3e604079149) desktop default: the loader
+    * returns "nouveau"/"nvgd", matching the validated RTX 3050 flow.
+    * Note: Blackwell+ (>= 0x1a0) loses the loader-level zink forcing
+    * upstream added; no Blackwell hardware exists in the lab.
     */
-   struct drm_nouveau_getparam r = { .param = NOUVEAU_GETPARAM_HAS_VMA_TILEMODE };
-   int ret = drmCommandWriteRead(fd, DRM_NOUVEAU_GETPARAM, &r, sizeof(r));
-   if (ret == 0 && r.value == 1) {
-      r.param = NOUVEAU_GETPARAM_CHIPSET_ID;
-      r.value = 0;
-      ret = drmCommandWriteRead(fd, DRM_NOUVEAU_GETPARAM, &r, sizeof(r));
-      if (ret == 0 && r.value >= 0x160) {
-         prefer_zink = true;
-      }
-      /* Nouveau GL isn't enabled on anything after Ada */
-      if (ret == 0 && r.value >= 0x1a0) {
-         require_zink = true;
-      }
-   }
-   assert(!require_zink || prefer_zink);
+   bool prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", false);
 
-   prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", prefer_zink);
-
-   bool use_zink = prefer_zink;
-   if (require_zink) {
-      /* nouveau_zink_predicate() typically gets called twice but we only want
-       * to warn once.
-       */
-      static bool warned = false;
-      if (!prefer_zink && !warned) {
-         log_(_LOADER_WARNING,
-              "NOUVEAU_USE_ZINK is ignored for Blackwell and later GPUs.\n");
-         warned = true;
-      }
-
-      use_zink = true;
-   }
-
-   if (use_zink && !strcmp(driver, "zink"))
+   if (prefer_zink && !strcmp(driver, "zink"))
       return true;
 
-   if (!use_zink && (!strcmp(driver, "nvgd") || !strcmp(driver, "nouveau")))
+   if (!prefer_zink && (!strcmp(driver, "nvgd") || !strcmp(driver, "nouveau")))
       return true;
    return false;
 #endif

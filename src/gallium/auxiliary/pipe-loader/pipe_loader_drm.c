@@ -116,6 +116,45 @@ get_nctx_caps(int fd, struct virgl_renderer_capset_drm *caps)
    return drmIoctl(fd, DRM_IOCTL_VIRTGPU_GET_CAPS, &args);
 }
 
+/* loader_get_pci_id_for_fd() supplies PCI device IDs, not nouveau chipset
+ * numbers (e.g. AD104 is PCI 0x2788, chipset 0x194). Keep this list aligned
+ * with nvenc_oclass() in nouveau_nvenc_backend.c. This only selects the
+ * video driver; the backend still checks its own capabilities.
+ */
+static bool
+nvidia_video_pci_id(unsigned device_id)
+{
+   switch (device_id) {
+   case 0x2584: /* GA107 */
+   case 0x2684: /* AD102 */
+   case 0x2685:
+   case 0x2689:
+   case 0x2702: /* AD103 */
+   case 0x2704:
+   case 0x2705:
+   case 0x2709:
+   case 0x2717:
+   case 0x2757:
+   case 0x2782: /* AD104 */
+   case 0x2783:
+   case 0x2786:
+   case 0x2788:
+   case 0x2803: /* AD106 */
+   case 0x2805:
+   case 0x2808:
+   case 0x2820:
+   case 0x2860:
+   case 0x2882: /* AD107 */
+   case 0x28a0:
+   case 0x28a1:
+   case 0x28e0:
+   case 0x28e1:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zink,
                              bool video)
@@ -146,7 +185,8 @@ pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zin
    const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
    if (video && !zink && (!override || !override[0]) &&
        ddev->base.type == PIPE_LOADER_DEVICE_PCI &&
-       ddev->base.u.pci.vendor_id == 0x10de && ddev->base.u.pci.chip_id == 0x2584 &&
+       ddev->base.u.pci.vendor_id == 0x10de &&
+       nvidia_video_pci_id(ddev->base.u.pci.chip_id) &&
        !strcmp(ddev->base.driver_name, "zink")) {
       FREE(ddev->base.driver_name);
       ddev->base.driver_name = strdup("nouveau");

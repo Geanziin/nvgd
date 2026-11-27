@@ -101,8 +101,26 @@ nouveau_vp3_video_buffer_create(struct pipe_context *pipe,
    struct pipe_sampler_view sv_templ;
    struct pipe_surface surf_templ;
 
-   if (templat->buffer_format != PIPE_FORMAT_NV12 || !templat->interlaced)
+   if (templat->buffer_format != PIPE_FORMAT_NV12 || !templat->interlaced) {
+      /* nvgd lab: force a linear layout for video surfaces on Ada
+       * (AD10x, chipset 0x192-0x197). This branch only runs for
+       * progressive surfaces; on Ada the VA frontend used to create
+       * every NV12 surface interlaced (see SUPPORTS_PROGRESSIVE below),
+       * so this patch was dead code until the -6 fix. With progressive
+       * surfaces the NVENC frontend falls back to its CPU
+       * readback+upload path (surface_usable() requires tile_mode
+       * 0x10), which is the same path the GA107 encode uses today.
+       * GA107 keeps the tiled layout: it works there and is faster.
+       */
+      const unsigned chipset =
+         nouveau_screen(pipe->screen)->device->chipset;
+      if (chipset >= 0x192 && chipset <= 0x197) {
+         struct pipe_video_buffer tmp = *templat;
+         tmp.flags |= NOUVEAU_RESOURCE_FLAG_LINEAR;
+         return vl_video_buffer_create(pipe, &tmp);
+      }
       return vl_video_buffer_create(pipe, templat);
+   }
 
    assert(templat->interlaced);
    assert(pipe_format_to_chroma_format(templat->buffer_format) == PIPE_VIDEO_CHROMA_FORMAT_420);
@@ -495,7 +513,24 @@ nouveau_vp3_screen_get_video_param(struct pipe_screen *pscreen,
          return 0;
       }
    case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
-       return chipset == 0x177 && profile == PIPE_VIDEO_PROFILE_UNKNOWN;
+      /* nvgd lab: Ada (AD10x) supports progressive VA surfaces, like
+       * GA107. Upstream returns true only for GA107 (0x177), so on Ada
+       * the VA frontend created every NV12 surface interlaced and
+       * nouveau_vp3_video_buffer_create took the VP3 path, which stores
+       * plain pipe_surface templates in buffer->surfaces[]. The VA
+       * frontend clears those surfaces at allocation; nvc0 reads them
+       * as nv50_surface and gets garbage RT dimensions (width = next
+       * surface's format enum: 81/82/0, height = first_layer: 1/0/1/0),
+       * so the clear rect (1280x360) exceeds the RT and the AD104 GR
+       * faults with Xid 13 "WIDTH CT Violation" (channel killed).
+       * Progressive surfaces take the generic vl path (where the -5
+       * linear-layout patch applies on Ada), and the NVENC frontend
+       * accepts the target (it rejects interlaced targets). GA107
+       * behavior is unchanged.
+       */
+      return (chipset == 0x177 || chipset == 0x192 || chipset == 0x193 ||
+              chipset == 0x194 || chipset == 0x196 || chipset == 0x197) &&
+         profile == PIPE_VIDEO_PROFILE_UNKNOWN;
    case PIPE_VIDEO_CAP_MAX_MACROBLOCKS:
       switch (codec) {
       case PIPE_VIDEO_FORMAT_MPEG12:

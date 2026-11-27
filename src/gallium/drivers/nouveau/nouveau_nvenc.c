@@ -83,6 +83,26 @@ backend_profile(enum pipe_video_profile profile)
    }
 }
 
+/* GA107 plus Ada. The backend selects C7B7 on GA107 and C9B7 on Ada;
+ * their H.264/HEVC submission methods match. Other chips stay off: encode
+ * is only enabled where it was validated or is under test.
+ */
+static bool
+chipset_supported(unsigned chipset)
+{
+   switch (chipset) {
+   case 0x177: /* GA107 */
+   case 0x192: /* AD102 */
+   case 0x193: /* AD103 */
+   case 0x194: /* AD104 */
+   case 0x196: /* AD106 */
+   case 0x197: /* AD107 */
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 kernel_supported(struct nouveau_screen *screen)
 {
@@ -103,7 +123,7 @@ nouveau_nvenc_param(struct nouveau_screen *screen,
                     enum pipe_video_profile profile,
                     enum pipe_video_cap param)
 {
-   if (screen->device->chipset != 0x177 ||
+   if (!chipset_supported(screen->device->chipset) ||
        !debug_get_bool_option("NOUVEAU_NVENC", true) ||
        !profile_supported(profile) || !kernel_supported(screen))
       return 0;

@@ -16,6 +16,7 @@
 #include "nvif/class.h"
 #include "clc5b0.h"
 #include "clc7b0.h"
+#include "clc9b0.h"
 #include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_debug.h"
@@ -104,6 +105,7 @@ open_channel(struct nouveau_screen *screen, struct nouveau_object **channel,
    if (ret)
       return ret;
    const struct nouveau_mclass classes[] = {
+      {NVC9B0_VIDEO_DECODER, -1},
       {NVC7B0_VIDEO_DECODER, -1},
       {0, 0},
    };
@@ -118,11 +120,22 @@ open_channel(struct nouveau_screen *screen, struct nouveau_object **channel,
 bool
 nouveau_nvdec_enabled(struct nouveau_screen *screen)
 {
-   /* Only the GA107 firmware/layout has been validated so far. This is not a
-    * Vulkan capability check: the native backend probes the DRM video channel.
+   /* GA107 and AD104 have frame-exact H.264/HEVC/VP9/AV1 decode evidence.
+    * Other Ada chips require an explicit test opt-in. Probe the DRM class
+    * instead of assuming that a successfully opened channel supports C7B0.
+    * TODO [PENDING EVIDENCE: AD102/103/106/107 NVDEC hardware validation].
     */
-   if (screen->device->chipset != 0x177 ||
-       !debug_get_bool_option("NOUVEAU_NVDEC", true))
+   const unsigned chipset = screen->device->chipset;
+   bool supported_chipset = chipset == 0x177 || chipset == 0x194;
+   switch (chipset) {
+   case 0x192:
+   case 0x193:
+   case 0x196:
+   case 0x197:
+      supported_chipset = debug_get_bool_option("NOUVEAU_NVDEC_ADA", false);
+      break;
+   }
+   if (!supported_chipset || !debug_get_bool_option("NOUVEAU_NVDEC", true))
       return false;
 
    simple_mtx_lock(&screen->fence.lock);
@@ -380,8 +393,13 @@ submit_frame(struct nouveau_nvdec *dec, unsigned current, enum nvdec_kind kind,
    struct nouveau_pushbuf *push = dec->push;
    const uint32_t seq = ++dec->sequence ? dec->sequence : ++dec->sequence;
    *(uint32_t *)dec->buffers[NVDEC_FENCE]->map = 0;
-   method(push, 0, kind == NVDEC_KIND_H264 ? NVC5B0_VIDEO_DECODER
-                                           : NVC7B0_VIDEO_DECODER);
+   /* Ada exposes C9B0 through GSP-RM. Keep GA107's existing H.264 selector,
+    * but never select an older class on a C9B0 object.
+    */
+   method(push, 0, dec->engine->oclass == NVC9B0_VIDEO_DECODER ?
+                  NVC9B0_VIDEO_DECODER :
+                  kind == NVDEC_KIND_H264 ? NVC5B0_VIDEO_DECODER :
+                                           NVC7B0_VIDEO_DECODER);
    method(push, NVC5B0_SET_APPLICATION_ID,
           kind == NVDEC_KIND_AV1 ? NVC7B0_SET_APPLICATION_ID_ID_AVD :
           kind == NVDEC_KIND_HEVC ? NVC7B0_SET_APPLICATION_ID_ID_HEVC :

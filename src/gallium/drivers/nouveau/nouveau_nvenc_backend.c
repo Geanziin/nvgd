@@ -24,6 +24,7 @@
 #include "drm-uapi/nouveau_drm.h"
 #include "nvif/ioctl.h"
 #include "clc7b7.h"
+#include "clc9b7.h"
 #include "util/log.h"
 #include "util/macros.h"
 #include "util/u_debug.h"
@@ -83,6 +84,7 @@ struct nvenc_backend {
    unsigned width, height, coded_width, coded_height, pitch, level;
    enum nvenc_profile profile;
    unsigned sequence, generation, frames;
+   uint32_t oclass; /* NVENC object class for this GPU */
    unsigned recon_idx;
    unsigned poc, rate_num, rate_den, sample_bytes;
    bool has_keyframe;
@@ -127,6 +129,66 @@ pci_id(const char *path)
    int ret = fscanf(file, "%x", &value);
    fclose(file);
    return ret == 1 ? (int)value : -1;
+}
+
+/* NVENC object class, per GPU generation.  The kernel (GSP-RM) maps the
+ * class per generation (nvkm/subdev/gsp/rm/: tu1xx.c:37 NVC4B7,
+ * ga1xx.c:37 NVC7B7, ad10x.c:37 NVC9B7, gb20x.c:41 NVCFB7) — asking for
+ * the wrong class makes NVIF fail with -EINVAL (validate-encode-reboot-7.md).
+ * This file only sees the DRM fd, so the generation is derived from the
+ * PCI device ID read from sysfs, the same number the gate already uses.
+ * The H.264/HEVC method offsets are identical between C7B7 and C9B7
+ * (only VP9-only methods and SET_UCODE_STATE differ, none used here), so
+ * only the class selector changes — push_frame() keeps the C7B7-named
+ * SET_* constants.  Only the generations admitted by the gate are mapped
+ * (GA107 + the lab's Ada list in
+ * src/linux/drivers/gpu/drm/nouveau/tensor_unlock/arch_610.h,
+ * GPU_UNLOCK_AD10X_IDS); Turing (NVC4B7) and Blackwell (NVCFB7) have no
+ * PCI IDs in the gate, so they stay fail-closed (0) — if the gate ever
+ * admits them, add their IDs and classes here.  Unknown IDs stay off:
+ * pci_id() returns -1 on error, which matches nothing below.
+ */
+static uint32_t
+nvenc_oclass(unsigned device_id)
+{
+   switch (device_id) {
+   case 0x2584: /* GA107 */
+      return NVC7B7_VIDEO_ENCODER;
+   case 0x2684: /* AD102 */
+   case 0x2685: /* AD102 */
+   case 0x2689: /* AD102 */
+   case 0x2702: /* AD103 */
+   case 0x2704: /* AD103 */
+   case 0x2705: /* AD103 */
+   case 0x2709: /* AD103 */
+   case 0x2717: /* AD103 */
+   case 0x2757: /* AD103 */
+   case 0x2782: /* AD104 */
+   case 0x2783: /* AD104 */
+   case 0x2786: /* AD104 */
+   case 0x2788: /* AD104 */
+   case 0x2803: /* AD106 */
+   case 0x2805: /* AD106 */
+   case 0x2808: /* AD106 */
+   case 0x2820: /* AD106 */
+   case 0x2860: /* AD106 */
+   case 0x2882: /* AD107 */
+   case 0x28a0: /* AD107 */
+   case 0x28a1: /* AD107 */
+   case 0x28e0: /* AD107 */
+   case 0x28e1: /* AD107 */
+      return NVC9B7_VIDEO_ENCODER;
+   default:
+      return 0;
+   }
+}
+
+/* Gate: a device is supported iff it maps to a known NVENC class.
+ * Single source of truth for the admitted set (see nvenc_oclass). */
+static bool
+nvenc_device_supported(unsigned device_id)
+{
+   return nvenc_oclass(device_id) != 0;
 }
 
 static int
@@ -243,7 +305,7 @@ channel_open(struct nvenc_backend *s)
                 .type = NVIF_IOCTL_V0_NEW},
       .object = {.handle = handle,
                  .object = handle,
-                 .oclass = NVC7B7_VIDEO_ENCODER,
+                 .oclass = s->oclass,
                  .route = NVIF_IOCTL_V0_ROUTE_NVIF,
                  .token = handle},
    };
@@ -344,7 +406,13 @@ nvenc_backend_create(int fd, unsigned width, unsigned height, unsigned qp,
    }
    snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/device",
             major(st.st_rdev), minor(st.st_rdev));
-   if (pci_id(path) != 0x2584) {
+   unsigned device_id = (unsigned)pci_id(path);
+   if (!nvenc_device_supported(device_id)) {
+      ret = -ENODEV;
+      goto fail;
+   }
+   s->oclass = nvenc_oclass(device_id);
+   if (!s->oclass) {
       ret = -ENODEV;
       goto fail;
    }
@@ -553,7 +621,9 @@ push_frame(struct nvenc_backend *s, struct slot *slot,
    const unsigned out_uv = out_recon == 0 ? SHARED_RECON_UV_0 : SHARED_RECON_UV_1;
 
    uint32_t *cursor = push->map;
-   method(&cursor, 0, NVC7B7_VIDEO_ENCODER);
+   /* Method 0 selects the NVENC object for the subchannel: the
+    * class created in channel_open() (NVC9B7 on Ada, NVC7B7 on GA107). */
+   method(&cursor, 0, s->oclass);
    bool hevc = nvenc_profile_is_hevc(s->profile);
    method(&cursor, NVC7B7_SET_APPLICATION_ID, hevc ? 3 : 1);
    method(&cursor, NVC7B7_SET_CONTROL_PARAMS, (hevc ? 4 : 3) | 0x100);
