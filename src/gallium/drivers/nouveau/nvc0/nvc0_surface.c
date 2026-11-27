@@ -301,14 +301,22 @@ nvc0_clear_render_target(struct pipe_context *pipe,
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
-   struct nv50_surface *sf = nv50_surface(dst);
-   struct nv04_resource *res = nv04_resource(sf->base.texture);
+   /* Gallium passes a pipe_surface template (including from
+    * u_default_clear_texture), not an nv50_surface allocation. Derive the
+    * hardware dimensions and offset before accessing the private fields.
+    */
+   struct nv50_surface *sf = nv50_surface(
+      nvc0_miptree_surface_new(pipe, dst->texture, dst));
+   struct nv04_resource *res = nv04_resource(dst->texture);
    unsigned z;
 
    assert(dst->texture->target != PIPE_BUFFER);
 
-   if (!PUSH_SPACE(push, 32 + sf->depth))
+   if (!sf)
       return;
+
+   if (!PUSH_SPACE(push, 32 + sf->depth))
+      goto out;
 
    PUSH_REF1 (push, res->bo, res->domain | NOUVEAU_BO_WR);
 
@@ -373,6 +381,9 @@ nvc0_clear_render_target(struct pipe_context *pipe,
       IMMED_NVC0(push, NVC0_3D(COND_MODE), nvc0->cond_condmode);
 
    nvc0->dirty_3d |= NVC0_NEW_3D_FRAMEBUFFER;
+
+out:
+   nv50_surface_destroy(pipe, &sf->base);
 }
 
 static void
@@ -638,15 +649,19 @@ nvc0_clear_depth_stencil(struct pipe_context *pipe,
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
    struct nv50_miptree *mt = nv50_miptree(dst->texture);
-   struct nv50_surface *sf = nv50_surface(dst);
+   struct nv50_surface *sf = nv50_surface(
+      nvc0_miptree_surface_new(pipe, dst->texture, dst));
    uint32_t mode = 0;
    int unk = mt->base.base.target == PIPE_TEXTURE_2D;
    unsigned z;
 
    assert(dst->texture->target != PIPE_BUFFER);
 
-   if (!PUSH_SPACE(push, 32 + sf->depth))
+   if (!sf)
       return;
+
+   if (!PUSH_SPACE(push, 32 + sf->depth))
+      goto out;
 
    PUSH_REF1 (push, mt->base.bo, mt->base.domain | NOUVEAU_BO_WR);
 
@@ -695,6 +710,9 @@ nvc0_clear_depth_stencil(struct pipe_context *pipe,
       IMMED_NVC0(push, NVC0_3D(COND_MODE), nvc0->cond_condmode);
 
    nvc0->dirty_3d |= NVC0_NEW_3D_FRAMEBUFFER;
+
+out:
+   nv50_surface_destroy(pipe, &sf->base);
 }
 
 void

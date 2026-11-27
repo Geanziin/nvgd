@@ -133,10 +133,14 @@ nvc0_state_unlock_kick(struct nvc0_context *nvc0)
     * only once the commands touching them are submitted (Chromium/ANGLE/Discord).
     * On Android, the back buffer is always an imported dma-buf from Gralloc,
     * which is presented explicitly at eglSwapBuffers() - holding work back
-    * across draws is safe and essential to prevent ioctl flooding.
-    * Multi-context deferral is safe because nvc0_state_lock() flushes any
-    * pending work from another context before that context records commands. */
-   bool can_defer = screen->defer_kicks && !nvc0_should_kick_deferred(screen);
+    * across draws avoids ioctl flooding.
+    * All contexts share a hardware channel. Keep multi-context submissions
+    * self-contained: deferred draws otherwise race with uploads/readbacks
+    * outside state_lock (mt-probe reproduces stale/black pixels on AD104).
+    * Preserve batching while only one context is active, as in 5c6ac88c4cd.
+    */
+   bool can_defer = screen->defer_kicks && screen->num_contexts == 1 &&
+                    !nvc0_should_kick_deferred(screen);
    if (can_defer && !screen->defer_imported &&
        nouveau_pushbuf_refs_imported(nvc0->base.pushbuf))
       can_defer = false;
